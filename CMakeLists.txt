@@ -6,7 +6,17 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # =========================
-# TLS FIX
+# Geode
+# =========================
+
+if (NOT DEFINED ENV{GEODE_SDK})
+    message(FATAL_ERROR "Geode SDK not found!")
+endif()
+
+include($ENV{GEODE_SDK}/cmake/Geode.cmake)
+
+# =========================
+# TLS Fix
 # =========================
 
 set(QUNET_USE_XTLS ON CACHE BOOL "" FORCE)
@@ -18,48 +28,28 @@ add_definitions(
 )
 
 # =========================
-# GEODE SETUP
-# =========================
-
-include(cmake/CPM.cmake)
-
-CPMAddPackage(
-    NAME Geode
-    GITHUB_REPOSITORY geode-sdk/geode
-    GIT_TAG nightly
-)
-
-# =========================
-# SOURCES
-# =========================
-
-file(GLOB_RECURSE SOURCES
-    src/*.cpp
-)
-
-# =========================
-# MOD
+# Mod
 # =========================
 
 geode_add_mod(globed
-    ${SOURCES}
+    src/main.cpp
 )
 
 # =========================
-# INCLUDES
+# Includes
 # =========================
 
-target_include_directories(globed PRIVATE
+target_include_directories(${PROJECT_NAME} PRIVATE
     include
     libs
 )
 
 # =========================
-# WINDOWS
+# Windows libs
 # =========================
 
 if (WIN32)
-    target_link_libraries(globed
+    target_link_libraries(${PROJECT_NAME}
         ws2_32
         crypt32
         secur32
