@@ -29,7 +29,23 @@ add_definitions(
 )
 
 # =========================
-# Setup Mod
+# Sources
+# =========================
+
+file(GLOB_RECURSE SOURCES
+    src/*.cpp
+)
+
+# =========================
+# Create target
+# =========================
+
+add_library(${PROJECT_NAME} SHARED
+    ${SOURCES}
+)
+
+# =========================
+# Setup Geode
 # =========================
 
 setup_geode_mod(${PROJECT_NAME})
