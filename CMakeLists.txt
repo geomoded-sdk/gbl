@@ -1,35 +1,9 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(Globed VERSION 2.1.4)
-
-# =========================
-# C++
-# =========================
+project(globed)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-
-# =========================
-# Windows / MSVC
-# =========================
-
-if (MSVC)
-    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
-
-    add_compile_options(
-        /W3
-        /EHsc
-        /utf-8
-        /MP
-    )
-else()
-    add_compile_options(
-        -Wall
-        -Wextra
-        -Wno-unused-parameter
-    )
-endif()
 
 # =========================
 # QUNET TLS FIX
@@ -44,7 +18,13 @@ add_definitions(
 )
 
 # =========================
-# Sources
+# GEODE
+# =========================
+
+find_package(Geode REQUIRED)
+
+# =========================
+# SOURCES
 # =========================
 
 file(GLOB_RECURSE SOURCES
@@ -52,13 +32,15 @@ file(GLOB_RECURSE SOURCES
 )
 
 # =========================
-# Library
+# MOD
 # =========================
 
-add_library(${PROJECT_NAME} SHARED ${SOURCES})
+geode_add_mod(${PROJECT_NAME}
+    ${SOURCES}
+)
 
 # =========================
-# Includes
+# INCLUDES
 # =========================
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -67,22 +49,14 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 )
 
 # =========================
-# Windows libs
+# WINDOWS
 # =========================
 
 if (WIN32)
     target_link_libraries(${PROJECT_NAME}
         ws2_32
-        winmm
         crypt32
         secur32
+        winmm
     )
 endif()
-
-# =========================
-# Output
-# =========================
-
-set_target_properties(${PROJECT_NAME} PROPERTIES
-    OUTPUT_NAME "globed"
-)
