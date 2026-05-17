@@ -6,14 +6,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # =========================
-# Geode
+# Geode SDK
 # =========================
 
-if (NOT DEFINED ENV{GEODE_SDK})
-    message(FATAL_ERROR "Geode SDK not found!")
-endif()
-
-include($ENV{GEODE_SDK}/cmake/Geode.cmake)
+include(cmake/GeodeFile.cmake)
 
 # =========================
 # TLS Fix
