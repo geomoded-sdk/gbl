@@ -1,35 +1,88 @@
 cmake_minimum_required(VERSION 3.21)
-set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
-set(CMAKE_CXX_STANDARD 23)
+
+project(Globed VERSION 2.1.4)
+
+# =========================
+# C++
+# =========================
+
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_VISIBILITY_PRESET hidden)
-set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY "BOTH")
-set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE "BOTH")
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-if ("${CMAKE_SYSTEM_NAME}" STREQUAL "iOS" OR IOS)
-    set(CMAKE_OSX_ARCHITECTURES "arm64")
+# =========================
+# Windows / MSVC
+# =========================
+
+if (MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+
+    add_compile_options(
+        /W3
+        /EHsc
+        /utf-8
+        /MP
+    )
 else()
-    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64")
+    add_compile_options(
+        -Wall
+        -Wextra
+        -Wno-unused-parameter
+    )
 endif()
 
-project(globed2 VERSION 1.0.0)
+# =========================
+# QUNET TLS FIX
+# =========================
 
-if (NOT DEFINED ENV{GEODE_SDK})
-    message(FATAL_ERROR "Unable to find Geode SDK! Please define GEODE_SDK environment variable to point to Geode")
-else()
-    message(STATUS "Found Geode: $ENV{GEODE_SDK}")
+set(QUNET_USE_XTLS ON CACHE BOOL "" FORCE)
+set(QUNET_USE_SCHANNEL ON CACHE BOOL "" FORCE)
+
+add_definitions(
+    -DQUNET_USE_XTLS
+    -DQUNET_USE_SCHANNEL
+)
+
+# =========================
+# Sources
+# =========================
+
+file(GLOB_RECURSE SOURCES
+    src/*.cpp
+)
+
+# =========================
+# Library
+# =========================
+
+add_library(${PROJECT_NAME} SHARED ${SOURCES})
+
+# =========================
+# Includes
+# =========================
+
+target_include_directories(${PROJECT_NAME} PRIVATE
+    include
+    libs
+)
+
+# =========================
+# Windows libs
+# =========================
+
+if (WIN32)
+    target_link_libraries(${PROJECT_NAME}
+        ws2_32
+        winmm
+        crypt32
+        secur32
+    )
 endif()
 
-# these have to come early, cant be in geobuild
-set(ARC_FEATURE_NET ON CACHE BOOL "" FORCE)
-set(GEODE_CODEGEN_EXTRA_ARGS "--skip-pugixml" CACHE STRING "" FORCE)
-set(GEODE_ASP_VERSION "#24760cb" CACHE STRING "" FORCE)
-set(GEODE_NO_PUGIXML_HEADER ON CACHE BOOL "" FORCE)
+# =========================
+# Output
+# =========================
 
-add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
-
-## Download net libs (ngtcp2, c-ares, openssl, zstd)
-include(cmake/DownloadNetLibs.cmake)
-
-CPMAddPackage("gh:dankmeme01/geobuild#4b84908")
-include("${CMAKE_CURRENT_BINARY_DIR}/geobuild-gen.cmake")
+set_target_properties(${PROJECT_NAME} PROPERTIES
+    OUTPUT_NAME "globed"
+)
