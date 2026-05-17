@@ -1,12 +1,12 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(globed)
+project(globed VERSION 2.1.4)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # =========================
-# QUNET TLS FIX
+# TLS FIX
 # =========================
 
 set(QUNET_USE_XTLS ON CACHE BOOL "" FORCE)
@@ -18,10 +18,16 @@ add_definitions(
 )
 
 # =========================
-# GEODE
+# GEODE SETUP
 # =========================
 
-find_package(Geode REQUIRED)
+include(cmake/CPM.cmake)
+
+CPMAddPackage(
+    NAME Geode
+    GITHUB_REPOSITORY geode-sdk/geode
+    GIT_TAG nightly
+)
 
 # =========================
 # SOURCES
@@ -35,7 +41,7 @@ file(GLOB_RECURSE SOURCES
 # MOD
 # =========================
 
-geode_add_mod(${PROJECT_NAME}
+geode_add_mod(globed
     ${SOURCES}
 )
 
@@ -43,7 +49,7 @@ geode_add_mod(${PROJECT_NAME}
 # INCLUDES
 # =========================
 
-target_include_directories(${PROJECT_NAME} PRIVATE
+target_include_directories(globed PRIVATE
     include
     libs
 )
@@ -53,7 +59,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 # =========================
 
 if (WIN32)
-    target_link_libraries(${PROJECT_NAME}
+    target_link_libraries(globed
         ws2_32
         crypt32
         secur32
