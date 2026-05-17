@@ -6,13 +6,19 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # =========================
-# Geode
+# Geode Bootstrap
 # =========================
 
-find_package(Geode REQUIRED PATHS ${CMAKE_SOURCE_DIR}/geode-sdk-clone)
+execute_process(
+    COMMAND git clone https://github.com/geode-sdk/geode.git geode-sdk
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    RESULT_VARIABLE GEODE_CLONE_RESULT
+)
+
+include(${CMAKE_BINARY_DIR}/geode-sdk/cmake/GeodeFile.cmake)
 
 # =========================
-# TLS Fix
+# TLS
 # =========================
 
 set(QUNET_USE_XTLS ON CACHE BOOL "" FORCE)
@@ -49,7 +55,7 @@ target_include_directories(globed PRIVATE
 )
 
 # =========================
-# Windows libs
+# Windows
 # =========================
 
 if (WIN32)
