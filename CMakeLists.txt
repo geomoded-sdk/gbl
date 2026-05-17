@@ -6,10 +6,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # =========================
-# Geode SDK
+# Geode
 # =========================
 
-include(cmake/GeodeFile.cmake)
+find_package(Geode REQUIRED PATHS ${CMAKE_SOURCE_DIR}/geode-sdk-clone)
 
 # =========================
 # TLS Fix
@@ -24,18 +24,26 @@ add_definitions(
 )
 
 # =========================
+# Sources
+# =========================
+
+file(GLOB_RECURSE SOURCES
+    src/*.cpp
+)
+
+# =========================
 # Mod
 # =========================
 
 geode_add_mod(globed
-    src/main.cpp
+    ${SOURCES}
 )
 
 # =========================
 # Includes
 # =========================
 
-target_include_directories(${PROJECT_NAME} PRIVATE
+target_include_directories(globed PRIVATE
     include
     libs
 )
@@ -45,7 +53,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 # =========================
 
 if (WIN32)
-    target_link_libraries(${PROJECT_NAME}
+    target_link_libraries(globed
         ws2_32
         crypt32
         secur32
