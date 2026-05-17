@@ -6,13 +6,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # =========================
-# Geode Bootstrap
+# Geode
 # =========================
 
 execute_process(
     COMMAND git clone https://github.com/geode-sdk/geode.git geode-sdk
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    RESULT_VARIABLE GEODE_CLONE_RESULT
 )
 
 include(${CMAKE_BINARY_DIR}/geode-sdk/cmake/GeodeFile.cmake)
@@ -30,26 +29,16 @@ add_definitions(
 )
 
 # =========================
-# Sources
+# Setup Mod
 # =========================
 
-file(GLOB_RECURSE SOURCES
-    src/*.cpp
-)
-
-# =========================
-# Mod
-# =========================
-
-geode_add_mod(globed
-    ${SOURCES}
-)
+setup_geode_mod(${PROJECT_NAME})
 
 # =========================
 # Includes
 # =========================
 
-target_include_directories(globed PRIVATE
+target_include_directories(${PROJECT_NAME} PRIVATE
     include
     libs
 )
@@ -59,7 +48,7 @@ target_include_directories(globed PRIVATE
 # =========================
 
 if (WIN32)
-    target_link_libraries(globed
+    target_link_libraries(${PROJECT_NAME}
         ws2_32
         crypt32
         secur32
