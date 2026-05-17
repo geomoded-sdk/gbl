@@ -1,96 +1,57 @@
-name: Build Globed
+cmake_minimum_required(VERSION 3.21)
 
-on:
-  workflow_dispatch:
-  push:
-    paths-ignore:
-      - 'docs/*.md'
-      - 'previews/**'
-      - 'README.md'
-      - 'rescale.py'
+project(globed VERSION 2.1.4)
 
-  # pull_request:
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        config:
-          - name: Windows
-            os: windows-latest
-            build-config: RelWithDebInfo
+# =========================
+# Geode
+# =========================
 
-          - name: macOS
-            os: macos-latest
+execute_process(
+    COMMAND git clone https://github.com/geode-sdk/geode.git geode-sdk
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
 
-          - name: iOS
-            os: macos-latest
-            target: iOS
+include(${CMAKE_BINARY_DIR}/geode-sdk/cmake/GeodeFile.cmake)
 
-          - name: Android32
-            os: ubuntu-latest
-            target: Android32
+# =========================
+# TLS
+# =========================
 
-          - name: Android64
-            os: ubuntu-latest
-            target: Android64
+set(QUNET_USE_XTLS ON CACHE BOOL "" FORCE)
+set(QUNET_USE_SCHANNEL ON CACHE BOOL "" FORCE)
 
-    name: ${{ matrix.config.name }}
-    runs-on: ${{ matrix.config.os }}
+add_definitions(
+    -DQUNET_USE_XTLS
+    -DQUNET_USE_SCHANNEL
+)
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+# =========================
+# Setup Mod
+# =========================
 
-      - name: Build the mod
-        uses: geode-sdk/build-geode-mod@main
-        with:
-          sdk: '5.6.1'
-          build-config: ${{ matrix.config.build-config || 'Release' }}
-          configure-args: '-DGLOBED_RELEASE=ON'
-          export-pdb: true
-          export-symbols: true
-          combine: true
-          target: ${{ matrix.config.target }}
-          # sccache is broken on macos, so use no cache there :(
-          ccache-variant: ${{ matrix.config.os != 'macos-latest' && 'sccache' || '' }}
+setup_geode_mod(${PROJECT_NAME})
 
-  package:
-    name: Package builds
-    runs-on: ubuntu-latest
-    needs: build
-    permissions: write-all
+# =========================
+# Includes
+# =========================
 
-    steps:
-      - name: Combine builds
-        uses: geode-sdk/build-geode-mod/combine@main
-        id: build
+target_include_directories(${PROJECT_NAME} PRIVATE
+    include
+    libs
+)
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: globed-build-output
-          path: ${{ steps.build.outputs.build-output }}
+# =========================
+# Windows
+# =========================
 
-      - name: Get latest release tag
-        id: getrelease
-        run: echo "tag=$(curl -s https://api.github.com/repos/${{ github.event.repository.full_name }}/releases/latest | jq -r .tag_name)" >> $GITHUB_OUTPUT
-
-      - name: Create nightly release
-        uses: andelf/nightly-release@main
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: nightly
-          name: 'Development Release'
-          body: |
-            This is a nightly build of Globed for commit ${{ github.sha }} (${{ github.event.head_commit.message }}).
-
-            > **Note:** this build might not be stable and may contain issues, use at your own risk!
-
-            Changes since the last release: ${{ github.event.repository.html_url }}/compare/${{ steps.getrelease.outputs.tag }}...nightly
-          files: |
-            ${{ steps.build.outputs.build-output }}/*.geode
-            ${{ steps.build.outputs.build-output }}/*.pdb
-            ${{ steps.build.outputs.build-output }}/*.sym
+if (WIN32)
+    target_link_libraries(${PROJECT_NAME}
+        ws2_32
+        crypt32
+        secur32
+        winmm
+    )
+endif()
