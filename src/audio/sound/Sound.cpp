@@ -1,0 +1,174 @@
+#include <globed/audio/sound/Sound.hpp>
+#include <globed/audio/AudioManager.hpp>
+
+using namespace geode::prelude;
+
+#define FMOD_UNWRAP(res) \
+    GEODE_UNWRAP(mapError(res))
+
+namespace globed {
+
+static auto system() {
+    return AudioManager::get().getSystem();
+}
+
+static auto mapError(FMOD_RESULT result) {
+    return AudioManager::get().mapError(result);
+}
+
+Sound::Sound(FMOD::Sound* sound) : m_sound(sound) {}
+
+Result<std::shared_ptr<Sound>> Sound::create(const std::filesystem::path& path, bool paused) {
+    return create(utils::string::pathToString(path).c_str(), paused);
+}
+
+Result<std::shared_ptr<Sound>> Sound::create(const char* path, bool paused) {
+    auto s = std::make_shared<Sound>(GEODE_UNWRAP(createRaw(path)));
+    // pre emptively register the sound so stop() gets called
+    s->registerSelf(s);
+
+    GEODE_UNWRAP(s->play(paused));
+    return Ok(s);
+}
+
+Result<std::shared_ptr<Sound>> Sound::create(const float* pcm, size_t samples, int sampleRate, int channels, bool paused) {
+    FMOD_CREATESOUNDEXINFO exinfo = {};
+
+    exinfo.cbsize = sizeof(FMOD_CREATESOUNDEXINFO);
+    exinfo.numchannels = channels;
+    exinfo.format = FMOD_SOUND_FORMAT_PCMFLOAT;
+    exinfo.defaultfrequency = sampleRate;
+    exinfo.length = sizeof(float) * samples;
+
+    FMOD::Sound* sound;
+
+    FMOD_UNWRAP(system()->createSound(
+        nullptr, FMOD_2D | FMOD_OPENUSER | FMOD_CREATESAMPLE, &exinfo, &sound)
+    );
+
+    float* data;
+    FMOD_UNWRAP(
+        sound->lock(0, exinfo.length, (void**)&data, nullptr, nullptr, nullptr)
+    );
+
+    std::memcpy(data, pcm, exinfo.length);
+
+    FMOD_UNWRAP(
+        sound->unlock(data, nullptr, exinfo.length, 0)
+    );
+
+    auto s = std::make_shared<Sound>(sound);
+
+    // pre emptively register the sound so stop() gets called
+    s->registerSelf(s);
+
+    GEODE_UNWRAP(s->play(paused));
+    return Ok(s);
+}
+
+void Sound::rawSetVolume(float volume) {
+    if (m_channel) {
+        m_channel->setVolume(volume);
+    }
+    m_rawVolume = volume;
+}
+
+bool Sound::isPlaying() const {
+    if (!m_sound) return false;
+    // if the sound hasn't loaded yet, return true so it's not cancelled
+    if (!m_channel) return m_delayedPlay.has_value();
+
+    bool playing = false;
+    if (FMOD_OK != m_channel->isPlaying(&playing)) {
+        return false;
+    }
+    // TODO: not sure if this becomes false after the sound ends
+
+    return playing;
+}
+
+void Sound::stop() {
+    if (m_channel) {
+        m_channel->stop();
+        m_channel = nullptr;
+    }
+
+    if (m_sound) {
+        m_sound->release();
+        m_sound = nullptr;
+    }
+}
+
+Result<FMOD::Sound*> Sound::createRaw(const char* path) {
+    FMOD::Sound* sound = nullptr;
+    auto e = system()->createSound(
+        utils::string::pathToString(path).c_str(),
+        FMOD_DEFAULT | FMOD_NONBLOCKING,
+        nullptr,
+        &sound
+    );
+    FMOD_UNWRAP(e);
+
+    return Ok(sound);
+}
+
+Result<> Sound::play(bool paused) {
+    return this->play(PlayOptions{paused});
+}
+
+Result<> Sound::play(PlayOptions options) {
+    if (!this->isReady()) {
+        m_delayedPlay = options;
+        return Ok();
+    }
+
+    return this->doPlay(options);
+}
+
+bool Sound::isReady() {
+    FMOD_OPENSTATE ostate;
+    unsigned int percent;
+    bool starving, busy;
+    m_sound->getOpenState(&ostate, &percent, &starving, &busy);
+
+    return ostate == FMOD_OPENSTATE_READY;
+}
+
+Result<> Sound::doPlay(PlayOptions options) {
+    GLOBED_ASSERT(!m_channel && "Sound is already playing");
+
+    // spawn as paused so we can set volume before playing
+    FMOD_UNWRAP(
+        system()->playSound(m_sound, nullptr, true, &m_channel)
+    );
+
+    m_channel->setVolumeRamp(true);
+    m_channel->setVolume(m_rawVolume);
+
+    // unpause if pause was false
+    if (!options.paused) {
+        m_channel->setPaused(false);
+    }
+
+    return Ok();
+}
+
+void Sound::onUpdate() {
+    if (m_delayedPlay && this->isReady()) {
+        if (auto e = this->doPlay(*m_delayedPlay).err()) {
+            log::warn("Failed to play sound (delayed play): {}", e);
+        }
+        m_delayedPlay.reset();
+    }
+}
+
+void Sound::setPaused(bool paused) {
+    if (m_delayedPlay) {
+        m_delayedPlay->paused = paused;
+    }
+    if (m_channel) {
+        m_channel->setPaused(paused);
+    }
+}
+
+}

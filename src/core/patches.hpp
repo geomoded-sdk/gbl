@@ -1,0 +1,60 @@
+#pragma once
+#include <Geode/platform/platform.hpp>
+
+namespace globed {
+
+template <uintptr_t Version, uintptr_t Offset, bool Cocos = false>
+struct PatchDef {
+    template <auto = 0>
+    operator uintptr_t() const {
+        static_assert(Version == GEODE_COMP_GD_VERSION, "Patch must be updated to a new version!");
+        return Offset;
+    }
+
+    template <typename Ty = void*>
+    Ty addr() const {
+        static_assert(Version == GEODE_COMP_GD_VERSION, "Patch must be updated to a new version!");
+#ifdef GEODE_IS_WINDOWS
+        if constexpr (Cocos) {
+            return (Ty)(geode::base::getCocos() + Offset);
+        } else
+#endif
+        {
+            return (Ty)(geode::base::get() + Offset);
+        }
+    }
+};
+
+#ifdef GEODE_IS_WINDOWS
+
+constexpr inline PatchDef<22081, 0x4abc20> PATCH_EGO_GETSAVESTRING_START;
+
+#elif defined GEODE_IS_ANDROID32
+
+constexpr inline PatchDef<0, 0> PATCH_EGO_GETSAVESTRING_START;
+
+#elif defined GEODE_IS_ANDROID64
+
+constexpr inline PatchDef<0, 0> PATCH_EGO_GETSAVESTRING_START;
+
+#elif defined GEODE_IS_ARM_MAC
+
+constexpr inline PatchDef<0, 0> PATCH_EGO_GETSAVESTRING_START;
+
+// Call to GJGameLevel::savePercentage within destroyPlayer; the BL instruction
+// TODO: sigscan
+constexpr inline PatchDef<22081, 0xa196c> PATCH_SAVE_PERCENTAGE_CALL;
+
+#elif defined GEODE_IS_INTEL_MAC
+
+constexpr inline PatchDef<0, 0> PATCH_EGO_GETSAVESTRING_START;
+
+#elif defined GEODE_IS_IOS
+
+constexpr inline PatchDef<0, 0> PATCH_EGO_GETSAVESTRING_START;
+
+#endif
+
+#undef DefPatch
+
+}

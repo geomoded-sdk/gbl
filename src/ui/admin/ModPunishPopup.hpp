@@ -1,0 +1,50 @@
+#pragma once
+
+#include <globed/core/data/UserPunishment.hpp>
+#include <globed/core/data/Messages.hpp>
+#include <globed/core/net/MessageListener.hpp>
+#include <ui/BasePopup.hpp>
+#include <ui/misc/LoadingPopup.hpp>
+
+#include <asp/time/Duration.hpp>
+#include <Geode/Geode.hpp>
+
+namespace globed {
+
+class ModUserPopup;
+
+class ModPunishPopup : public BasePopup {
+public:
+    static ModPunishPopup* create(
+        int accountId, UserPunishmentType type, std::optional<UserPunishment> punishment
+    );
+    using Callback = geode::Function<void()>;
+
+    void setCallback(Callback&& cb);
+
+protected:
+    int m_accountId;
+    UserPunishmentType m_type;
+    std::optional<UserPunishment> m_punishment;
+    Callback m_callback;
+
+    geode::TextInput *m_reasonInput, *m_daysInput, *m_hoursInput;
+    std::map<asp::time::Duration, CCMenuItemToggler*> m_durationButtons;
+    asp::time::Duration m_currentDuration{};
+
+    MessageListener<msg::AdminResultMessage> m_listener;
+    LoadingPopup* m_loadPopup = nullptr;
+
+    bool init(int accountId, UserPunishmentType type, std::optional<UserPunishment> pun);
+    void setDuration(asp::time::Duration dur, bool inCallback = false);
+    void setReason(const std::string& reason);
+    void appendReason(const std::string& reason);
+    void inputChanged();
+    void submit();
+    void submitRemoval();
+
+    void startWaiting();
+    void stopWaiting(const msg::AdminResultMessage& msg);
+};
+
+}

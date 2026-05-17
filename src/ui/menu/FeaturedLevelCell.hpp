@@ -1,0 +1,53 @@
+#pragma once
+
+#include <globed/prelude.hpp>
+#include <globed/core/net/MessageListener.hpp>
+#include <globed/core/data/Messages.hpp>
+#include <ui/misc/GradientLabel.hpp>
+
+#include <cue/LoadingCircle.hpp>
+
+namespace globed {
+
+class FeaturedLevelCell : public CCLayer {
+public:
+    static FeaturedLevelCell* create();
+    ~FeaturedLevelCell();
+
+    void reloadFull();
+    void reload(bool fromFullReload = false);
+
+protected:
+    static constexpr float CELL_WIDTH = 380.f;
+    static constexpr float CELL_HEIGHT = 116.f;
+
+    bool init() override;
+    void updatePlayerCount(uint16_t count);
+    void createCell();
+
+    void showLoading();
+    void hideLoading();
+    void removeLoadedElements();
+
+    void levelLoaded(Result<GJGameLevel*, int> result);
+
+    void requestPlayerCount(float);
+
+    Ref<CCMenu> m_menu;
+    Ref<geode::NineSlice> m_bg;
+    Ref<geode::NineSlice> m_loadedBg;
+    Ref<CCNode> m_loadedContainer;
+    Ref<geode::NineSlice> m_playersBg;
+    Ref<CCNode> m_playerCountContainer;
+    Ref<CCNode> m_playerCountIcon;
+    Ref<cue::LoadingCircle> m_loadingCircle;
+    Ref<GradientLabel> m_playerCountLabel;
+
+    MessageListener<msg::PlayerCountsMessage> m_playerCountListener;
+    MessageListener<msg::FeaturedLevelMessage> m_levelListener;
+
+    std::optional<FeaturedLevelMeta> m_levelMeta;
+    Ref<GJGameLevel> m_level;
+};
+
+}

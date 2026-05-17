@@ -1,0 +1,486 @@
+"""
+Globed pre-build script.
+This script is invoked by cmake when configuring the project, you'll find that
+most of the build configuration is done here, rather than CMakeLists.txt.
+
+This file ends up generating the mod.json and a .cmake file that gets included by the main CMakeLists.txt.
+For more details, see https://github.com/dankmeme01/geobuild/
+"""
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .build.geobuild.prelude import *
+
+from pathlib import Path
+from dataclasses import dataclass, field
+from datetime import datetime, UTC
+import tomllib
+import sys
+
+# minimum required geode, can be a commit or a tag
+REQUIRED_GEODE_VERSION = "v5.6.1"
+XTLS_VERSION = "e29f88a"
+QUNET_VERSION = "9853934"
+SERVER_SHARED_VERSION = "d6b8df4"
+CUE_VERSION = "d1c7ad2"
+
+if sys.version_info < (3, 12):
+    raise RuntimeError("Globed's build system requires Python 3.12 or higher")
+
+@dataclass
+class GlobedConfig:
+    cpm_overrides: dict[str, Path] = field(default_factory=dict)
+    cmake_vars : dict[str, str] = field(default_factory=dict)
+    debug: bool = False
+    release: bool = False
+    asan: bool = False
+    oss: bool = False
+    voice: bool = True
+    ext_transports: bool = True
+    advanced_dns: bool = True
+    update_check: bool = False
+    ignore_geode_mismatch: bool = False
+    github_token: str = ""
+
+    modules: set[str] = field(default_factory=set)
+    server_url: str = "qunet://globed.dev"
+
+    @classmethod
+    def load(cls):
+        path = Path(__file__).parent / "config.toml"
+        if not path.exists():
+            return cls()
+
+        cfg = tomllib.loads(path.read_text())
+        out = cls()
+
+        def get_or(d: dict, key: str, default):
+            if key in d and isinstance(d[key], type(default)):
+                return d[key]
+            return default
+
+        if "cpm_overrides" in cfg and isinstance(cfg["cpm_overrides"], dict):
+            for key, val in cfg["cpm_overrides"].items():
+                if isinstance(val, str):
+                    out.cpm_overrides[key] = Path(val)
+
+        if "build" in cfg and isinstance(cfg["build"], dict):
+            build = cfg["build"]
+            out.debug = get_or(build, "debug", out.debug)
+            out.release = get_or(build, "release", out.release)
+            out.oss = get_or(build, "oss", out.oss)
+            out.asan = get_or(build, "asan", out.asan)
+            out.voice = get_or(build, "voice", out.voice)
+            out.ext_transports = get_or(build, "ext_transports", out.ext_transports)
+            out.advanced_dns = get_or(build, "advanced_dns", out.advanced_dns)
+            out.update_check = get_or(build, "update_check", out.debug) # enabled by default in debug
+            out.ignore_geode_mismatch = get_or(build, "ignore_geode_mismatch", out.ignore_geode_mismatch)
+
+            modules = get_or(build, "modules", [])
+            for mod in modules:
+                if isinstance(mod, str):
+                    out.modules.add(mod)
+
+            out.server_url = get_or(build, "server_url", out.server_url)
+            out.github_token = get_or(build, "github_token", out.github_token)
+
+        if "cmake_vars" in cfg and isinstance(cfg["cmake_vars"], dict):
+            for key, val in cfg["cmake_vars"].items():
+                if isinstance(val, str):
+                    out.cmake_vars[key] = val
+
+        return out
+
+    @classmethod
+    def release_config(cls):
+        out = cls()
+        # set some important defaults for release
+        out.debug = False
+        out.release = True
+        out.voice = True
+        out.ext_transports = True
+        out.advanced_dns = True
+        return out
+
+@dataclass
+class State:
+    build: Build
+    config: GlobedConfig
+
+def print_info(state: State):
+    build = state.build
+    config = build.config
+    gc = state.config
+
+    modulestr = ', '.join(sorted(gc.modules)) or "<none>"
+
+    print(f"========== Globed build configuration ==========")
+    print(f"Platform: {build.platform.name}, host: {build.config.host_desc()}, debug: {gc.debug}, release: {gc.release}, OSS build: {gc.oss}")
+    print(f"Voice: {gc.voice}, server URL: '{gc.server_url}', modules: {modulestr}")
+    print(f"Compiler: {config.compiler_id} {config.compiler_version}, frontend: '{config.compiler_frontend}'")
+    print("=================================================")
+
+def make_constants_codegen(state: State) -> str:
+    build = state.build
+    config = build.config
+    gc = state.config
+    build_opts = []
+
+    for mod in gc.modules:
+        build_opts.append(f"mod:{mod}")
+
+    if gc.debug: build_opts.append("debug")
+    if gc.release: build_opts.append("release")
+    if gc.oss: build_opts.append("oss")
+    if gc.voice: build_opts.append("voice")
+
+    constants = {
+        "discord": "https://discord.gg/d56q5Dkdm3",
+        "discord-bots": "https://discord.gg/3dddQZsysw",
+        "globed-commit": config.get_mod_commit() or "",
+        "geode-commit": config.get_sdk_commit() or "",
+        "build-time": datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC'),
+        "build-env": f"{config.compiler_id} {config.compiler_version} ({config.compiler_frontend})",
+        "build-opts": " ".join(build_opts),
+    }
+
+    out = f"// Auto-generated by geobuild.py at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    out += "#include <globed/core/Constants.hpp>\n"
+    out += "namespace globed {\n"
+    out += "const char* constantByHash(uint32_t hash) {\n"
+    out += "    switch (hash) {\n"
+
+    for key, value in constants.items():
+        keystr = repr(key).replace("'", '"')
+        valstr = repr(value).replace("'", '"')
+
+        out += f'        case adler32({keystr}): return {valstr};\n'
+
+    out += "    }\n"
+    out += "    return \"<invalid constant>\";\n"
+    out += "}\n"
+    out += "} // namespace globed\n"
+
+    return out
+
+def setup_unity(build: Build, gc: GlobedConfig):
+    build.add_raw_statement("""
+    set_target_properties(
+        ${PROJECT_NAME} PROPERTIES
+        UNITY_BUILD ON
+        UNITY_BUILD_MODE GROUP
+        UNITY_BUILD_UNIQUE_ID "$unity"
+    )""")
+
+    groups = {
+        "audio": [
+            "src/audio/*.cpp",
+            "src/audio/sound/*.cpp",
+        ],
+        "core": [
+            "src/core/data/*.cpp",
+            # net
+            "src/core/*.cpp",
+        ],
+        "core2": [
+            "src/core/hooks/*.cpp",
+            "src/core/preload/*.cpp",
+        ],
+        "core3": [
+            "src/core/game/*.cpp",
+            "src/soft-link/*.cpp",
+            "src/util/*.cpp",
+        ],
+        "net": [
+            "src/core/net/*.cpp",
+        ],
+        "ui1": [
+            "src/ui/admin/*.cpp",
+        ],
+        "ui2": [
+            "src/ui/game/*.cpp",
+            "src/ui/menu/levels/*.cpp",
+            "src/ui/*.cpp",
+            "src/ui/notification/*.cpp",
+        ],
+        "ui3": [
+            "src/ui/menu/*.cpp",
+            "-src/ui/menu/GlobedMenuLayer.cpp",
+            "-src/ui/menu/RegionSelectPopup.cpp",
+            "-src/ui/menu/TeamManagementPopup.cpp",
+        ],
+        "ui4": [
+            "src/ui/misc/*.cpp",
+            # move some from menu/ here, this is a relatively small group
+            "src/ui/menu/GlobedMenuLayer.cpp",
+            "src/ui/menu/RegionSelectPopup.cpp",
+            "src/ui/menu/TeamManagementPopup.cpp",
+        ],
+        "ui5": [
+            "src/ui/settings/*.cpp",
+            "src/ui/settings/cells/*.cpp",
+        ],
+        "modules": []
+    }
+
+    for mod in gc.modules:
+        mod_dir = build.config.project_dir / "src" / "modules" / mod
+        if not mod_dir.exists():
+            continue
+
+        groups["modules"].extend(str(p.relative_to(build.config.project_dir)) for p in mod_dir.rglob("*.cpp"))
+
+    print("Generating unity groups and checking balancing..")
+
+    for group, globs in groups.items():
+        loc = 0
+        filecount = 0
+
+        stmt = "set_source_files_properties(\n"
+        exclusions = []
+        for s in globs:
+            if s.startswith("-"):
+                exclusions.extend(build.config.project_dir.glob(s[1:]))
+
+        for glob in globs:
+            if glob.startswith("-"):
+                continue
+            for path in build.config.project_dir.glob(glob):
+                if path in exclusions:
+                    continue
+                stmt += f"    \"{str(path.absolute()).replace('\\', '\\\\')}\"\n"
+                loc += path.read_bytes().count(b'\n')
+                filecount += 1
+
+        stmt += f"    PROPERTIES UNITY_GROUP {group}\n)\n"
+        build.add_raw_statement(stmt)
+        print(f"Group '{group}' - {filecount} files, {loc} lines")
+
+    # also try unity for certain deps that work with it
+    def unity_dep(name: str, batch: int = 32):
+        build.add_raw_statement(f"set_target_properties({name} PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE {batch})")
+
+    unity_dep("capnp")
+    unity_dep("kj")
+    unity_dep("xtls")
+
+def main(build: Build):
+    if build.config.bool_var("GLOBED_RELEASE"):
+        print("!! GLOBED_RELEASE is defined, setting actions configuration !!")
+        gc = GlobedConfig.release_config()
+    else:
+        gc = GlobedConfig.load()
+
+    config = build.config
+    state = State(build=build, config=gc)
+
+    print_info(state)
+
+    # Allow building with clang-cl
+    pass  # Removed compiler check
+
+    if not gc.ignore_geode_mismatch:
+        build.verify_sdk_at_least(REQUIRED_GEODE_VERSION)
+
+    # Reconfigure when certain files change
+    build.reconfigure_if_changed(config.project_dir / "config.toml")
+
+    # Add necessary modules
+    gc.modules.add("deathlink")
+    gc.modules.add("two-player")
+    gc.modules.add("ui")
+    gc.modules.add("collision")
+    gc.modules.add("active-player-switch")
+
+    # Add base sources
+    src = config.project_dir / "src"
+    build.add_source_dir(src / "core")
+    build.add_source_dir(src / "audio")
+    build.add_source_dir(src / "util")
+    build.add_source_dir(src / "ui")
+    build.add_source_dir(src / "soft-link")
+    plat_dir = src / "platform" / config.platform.platform_str()
+    if plat_dir.exists():
+        # src/platform/<windows|android|ios|macos> , optional
+        build.add_source_dir(plat_dir)
+
+    # Add codegenned source file
+    codegen_path = config.build_dir / "globed-constants-codegen.cpp"
+    codegen_path.write_text(make_constants_codegen(state))
+    build.add_source_file(codegen_path)
+
+    # Add precompiled headers
+    # Release builds have way more headers, since they build from scratch anyway
+    pch = src / "platform" / ("pch-release.hpp" if gc.release else "pch-debug.hpp")
+    build.add_precompile_headers(pch)
+
+    # Include dirs
+    build.add_include_dir(config.project_dir / "include", Privacy.PUBLIC)
+    build.add_include_dir(config.project_dir / "src")
+    build.add_include_dir(config.project_dir / "libs")
+
+    # Compile definitions / variables
+    if gc.release:
+        build.enable_lto()
+        if config.platform.is_android():
+            build.add_raw_statement(f'set(CMAKE_SHARED_LINKER_FLAGS "${{CMAKE_SHARED_LINKER_FLAGS}} -Wl,--version-script={config.project_dir / "exports.map"}")')
+
+    # if gc.asan and build.platform.is_android():
+    #     print("Enabling UBSan flags")
+    #     build.add_raw_statement('set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined")')
+    #     build.add_raw_statement('set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=undefined")')
+    #     build.add_raw_statement('set(CMAKE_LINKER_FLAGS "${CMAKE_LINKER_FLAGS} -fsanitize=undefined")')
+
+    build.add_definition("GLOBED_BUILD")
+    build.add_definition("GLOBED_DEFAULT_MAIN_SERVER_URL", f'"{gc.server_url}"')
+    build.add_definition("UIBUILDER_NO_ARROW", "1")
+
+    if gc.debug:
+        build.add_definition("GLOBED_DEBUG", "1")
+        build.set_variable("QUNET_DEBUG", "ON")
+        build.add_compile_options("-Wall", "-Wextra")
+
+    build.add_compile_options(
+        "-Wno-unused-variable",
+        "-Wno-unused-function",
+        "-Wno-unused-parameter",
+        "-Wno-ignored-qualifiers",
+        "-Wno-unused-but-set-variable",
+        "-Wno-overloaded-virtual",
+        "-Wno-missing-field-initializers",
+        "-Wno-missing-designated-field-initializers",
+        "-Wno-unused-private-field",
+        "-Wno-vla-cxx-extension"
+    )
+
+    if gc.voice:
+        build.add_definition("GLOBED_VOICE_SUPPORT", "1")
+        if config.platform.is_windows():
+            build.add_definition("GLOBED_VOICE_CAN_TALK", "1")
+
+    # Add geode dependencies
+    build.enable_mod_json_generation("mod.json.template")
+    assert build.mod_json is not None # for type checkers
+
+    # allow any geode version, since we earlier verified that it's at least the required version
+    if not gc.release:
+        build.relax_geode_requirement()
+
+    build.add_geode_dep("geode.node-ids", ">=v1.10.0")
+    build.add_geode_dep("prevter.imageplus", {
+        "version": ">=v1.1.0",
+        "required": False,
+    })
+    build.add_geode_dep("geode.devtools", {
+        "version": ">=v1.13.1",
+        "required": False
+    })
+
+    if 'scripting-ui' in gc.modules:
+        build.add_geode_dep("alphalaneous.editortab_api", ">=2.1.0")
+        build.mod_json["resources"]["sprites"].append("resources/editor/*.png")
+
+    # fixup mod.json version in debug builds, be more strict for release builds
+    if gc.debug:
+        geode_ver = config.get_sdk_commit_or_tag()
+        if geode_ver and ('v' in geode_ver or '.' in geode_ver):
+            assert build.mod_json is not None
+            build.mod_json["geode"] = geode_ver.strip('v')
+
+    # Add module sources, compile defs
+    modules_dir = src / "modules"
+    for module in gc.modules:
+        mdir = modules_dir / module
+
+        if not mdir.exists():
+            mdir = modules_dir / "comm" / module
+
+        if not mdir.exists():
+            raise FileNotFoundError(f"Failed to find sources for module '{module}'")
+
+        build.add_source_dir(mdir)
+        transformed = module.upper().replace("-", "_")
+        build.add_definition(f"GLOBED_MODULE_{transformed}", "1")
+
+    # Link to bb if not oss build
+    if gc.oss:
+        build.add_definition("GLOBED_OSS_BUILD", "1")
+    else:
+        if config.platform.is_windows():
+            build.link_libraries("libs/bb/bb.lib", "ntdll.lib", "userenv.lib", "runtimeobject.lib", "Iphlpapi.lib", "bcrypt.lib", "crypt32.lib")
+        else:
+            build.link_library(f"libs/bb/bb-{config.platform.platform_str(include_bit=True)}.a")
+
+    if gc.ext_transports:
+        build.add_definition("GLOBED_QUIC_SUPPORT", "1")
+        build.add_definition("GLOBED_WS_SUPPORT", "1")
+
+    ## Add cmake dependencies ##
+
+    build.add_cpm_dep("capnproto/capnproto", "v1.4.0", {
+        "CAPNP_LITE": "ON",
+        "BUILD_TESTING": "OFF",
+        "WITH_FIBERS": "OFF",
+    }, link_name="CapnProto::capnp")
+    build.add_cpm_dep("GlobedGD/server-shared", SERVER_SHARED_VERSION, link_name="ServerShared")
+    # Disable XTLS if ext_transports is disabled (wolfssl not available)
+    # build.add_cpm_dep("dankmeme01/xtls", XTLS_VERSION, {
+    #     "XTLS_ENABLE_WOLFSSL": "ON",
+    #     "XTLS_ENABLE_SOCKET": "ON",
+    #     "XTLS_ENABLE_ARC_SOCKET": "ON",
+    # })
+    build.add_cpm_dep("dankmeme01/qunet-cpp", QUNET_VERSION, {
+        "QUNET_QUIC_SUPPORT": "ON" if gc.ext_transports else "OFF",
+        "QUNET_WS_SUPPORT": "ON" if gc.ext_transports else "OFF",
+        "QUNET_TLS_SUPPORT": "OFF",  # Disabled - requires XTLS/wolfssl
+        "QUNET_ADVANCED_DNS": "ON" if gc.advanced_dns else "OFF",
+        "QUNET_DEBUG": "ON" if gc.debug else "OFF",
+        "QUNET_ENABLE_WOLFSSL": "OFF",
+        "QUNET_ENABLE_OPENSSL": "OFF",
+    }, link_name="qunet")
+    build.add_cpm_dep("dankmeme01/uibuilder", "618ec98", link_name="UIBuilder")
+    build.add_cpm_dep("dankmeme01/cue", CUE_VERSION)
+    build.add_cpm_dep("zeux/pugixml", "v1.15", link_name="pugixml-static", options = {
+        "PUGIXML_NO_EXCEPTIONS": "ON",
+    })
+    # build.add_cpm_dep("GlobedGD/argon", "v1.4.9")  # Disabled - crashes MSVC
+    build.add_cpm_dep("Prevter/sinaps", "b9c3434")
+    build.add_cpm_dep("Prevter/AdvancedLabel", "17ed1c1", link_name="advanced_label")
+
+    if gc.voice:
+        build.add_cpm_dep("xiph/opus", "v1.6.1", {
+            "OPUS_INSTALL_PKG_CONFIG_MODULE": "OFF",
+            "OPUS_BUILD_SHARED_LIBRARY": "OFF",
+            "OPUS_BUILD_TESTING": "OFF",
+            "BUILD_TESTING": "OFF",
+            "OPUS_BUILD_PROGRAMS": "OFF",
+        })
+        build.add_definition("GLOBED_VOICE_SUPPORT", "1", Privacy.PUBLIC)
+
+    if config.platform.is_android():
+        build.link_libraries("EGL", "GLESv2", "android")
+    elif config.platform.is_apple():
+        build.add_raw_statement(f"target_link_libraries({config.project_name} PRIVATE \"-framework Security\")")
+
+    build.silence_warnings_for("kj")
+    build.silence_warnings_for("capnp")
+    build.silence_warnings_for("opus")
+
+    # setup unity build
+    if gc.release:
+        setup_unity(build, gc)
+
+    # cpm overrides
+    for name, path in gc.cpm_overrides.items():
+        build.set_variable(f"CPM_{name}_SOURCE", str(path.resolve()))
+
+    # check dep updates if enabled
+    if gc.update_check:
+        if gc.github_token:
+            build.config.vars["GITHUB_TOKEN"] = gc.github_token
+
+        try:
+            import requests as _
+            build.check_for_updates()
+        except ImportError:
+            print("!! Warning: 'requests' module not found, cannot check for updates")

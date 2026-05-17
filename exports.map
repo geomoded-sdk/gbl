@@ -1,0 +1,8 @@
+{
+  # export just the globed symbols
+  global:
+    *globed*;
+
+  local:
+    *;
+};

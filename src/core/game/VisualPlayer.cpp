@@ -1,0 +1,1062 @@
+#include <globed/core/game/VisualPlayer.hpp>
+#include <globed/core/SettingsManager.hpp>
+#include <globed/core/RoomManager.hpp>
+#include <globed/audio/AudioManager.hpp>
+#include <globed/util/lazy.hpp>
+#include <core/preload/PreloadManager.hpp>
+#include <core/hooks/GJBaseGameLayer.hpp>
+#include <core/game/SettingCache.hpp>
+#include <core/net/NetworkManagerImpl.hpp>
+#include <ui/misc/NameLabel.hpp>
+#include <ui/game/EmoteBubble.hpp>
+#include <Geode/modify/CCScheduler.hpp>
+
+#include <UIBuilder.hpp>
+#include <cue/Util.hpp>
+
+static constexpr int ROBOT_FIRE_ACTION = 1325385193;
+static constexpr int VISUAL_PLAYER_TAG = 3458738;
+
+using namespace geode::prelude;
+
+namespace globed {
+
+namespace $unity {
+
+static auto& g_settings = CachedSettings::get();
+static bool g_changeParticleUpdate = false;
+
+static inline bool lerpDebug() {
+    static bool val = Loader::get()->getLaunchFlag("globed/core.dev.lerp-debug");
+    return val;
+}
+
+}
+
+VisualPlayer::VisualPlayer() : PlayerObject(geode::ZeroConstructor, 0)
+{
+    // TODO: this is a very temp fix, complete this and bring this to geode bindings
+    // gobj incomplete
+    m_boxOffsetCalculated = true;
+    m_scaleX = 1.0f;
+    m_scaleY = 1.0f;
+    m_unk4C0 = -1;
+    m_unk4C4 = -1;
+    m_unk4C8 = -1;
+    m_unk4CC = -1;
+    m_unk50C = 1.0f;
+    m_defaultZLayer = ZLayer::T1;
+    m_pixelScaleX = 1.0f;
+    m_areaOpacityValue = 1.0f;
+
+    // pobj
+    m_lastCollisionBottom = -1;
+    m_lastCollisionTop = -1;
+    m_lastCollisionLeft = -1;
+    m_lastCollisionRight = -1;
+    m_unk50C = -1;
+    m_unk510 = -1;
+    new (&m_rotateObjectsRelated) decltype(m_rotateObjectsRelated)();
+    new (&m_potentialSlopeMap) decltype(m_potentialSlopeMap)();
+    m_rotateSpeed = 1.0f;
+    new (&m_ringRelatedSet) decltype(m_ringRelatedSet)();
+    m_playerSpeed = 0.9f;
+    m_platformerVelocityRelated = 1.0f;
+    new (&m_touchedRings) decltype(m_touchedRings)();
+    m_gravityMod = 1.0f;
+    new (&m_jumpPadRelated) decltype(m_jumpPadRelated)();
+    new (&m_holdingButtons) decltype(m_holdingButtons)();
+    new (&m_currentRobotAnimation) gd::string("run");
+}
+
+bool VisualPlayer::init(GJBaseGameLayer* gameLayer, RemotePlayer* rp, CCNode* playerNode, bool isSecond, bool localPlayer) {
+    using namespace $unity;
+
+    this->setTag(VISUAL_PLAYER_TAG);
+
+    g_changeParticleUpdate = true;
+    if (!PlayerObject::init(1, 1, gameLayer, gameLayer->m_objectLayer, !gameLayer->m_isEditor)) {
+        g_changeParticleUpdate = false;
+        return false;
+    }
+    g_changeParticleUpdate = false;
+
+    // override some things, because gd sets those from gamemanager
+    m_shipStreakType = ShipStreak::None;
+    cue::resetNode(m_shipStreak);
+
+    m_remotePlayer = rp;
+    m_isLocalPlayer = localPlayer;
+    m_isSecond = isSecond;
+    m_isEditor = gameLayer->m_isEditor;
+    m_isPlatformer = gameLayer->m_level->isPlatformer();
+    m_playerNode = playerNode;
+
+    // preload the cube icon so the passengers are correct
+    this->updateIconType(PlayerIconType::Cube);
+    m_prevMode = PlayerIconType::Cube;
+
+    // create the name label
+    bool showName = localPlayer ? g_settings.selfName : g_settings.showNames;
+    if (isSecond) {
+        showName = showName && !localPlayer && g_settings.dualName;
+    }
+
+    m_forceHideName = !showName;
+
+    m_nameLabel = Build<NameLabel>::create("", "chatFont.fnt")
+        .visible(showName)
+        .pos(0.f, NAME_OFFSET)
+        .parent(playerNode)
+        .store(m_nameLabel);
+
+    m_nameLabel->setShadowEnabled(true);
+
+    if (m_isLocalPlayer) {
+        auto& nm = NetworkManagerImpl::get();
+        if (auto sud = nm.getOwnSpecialData()) {
+            m_nameLabel->updateWithRoles(*sud);
+        }
+
+        auto& rm = RoomManager::get();
+        if (auto team = rm.getCurrentTeam()) {
+            m_nameLabel->updateTeam(rm.getCurrentTeamId(), team->color);
+        }
+    }
+
+    // create status icons
+    bool showStatus = !isSecond &&
+        (localPlayer ? g_settings.selfStatusIcons : g_settings.showStatusIcons);
+
+    if (showStatus) {
+        float opacity = static_cast<unsigned char>(g_settings.playerOpacity * 255.f);
+        m_statusIcons = Build<PlayerStatusIcons>::create(opacity)
+            .scale(0.8f)
+            .anchorPoint(0.5f, 0.f)
+            .pos(0.f, showName ? STATUS_ICONS_OFFSET : NAME_OFFSET)
+            .parent(playerNode)
+            .id("status-icons"_spr);
+    }
+
+    if (lerpDebug() && !m_isLocalPlayer) {
+        Build<CCDrawNode>::create()
+            .id(fmt::format("debug-trajectory"_spr).c_str())
+            .parent(gameLayer->m_objectLayer)
+            .store(m_playerTrajectory);
+
+        m_playerTrajectory->m_bUseArea = false;
+    }
+
+    this->updateOpacity();
+
+    return true;
+}
+
+void VisualPlayer::updateFromData(
+    const PlayerObjectData& data,
+    const PlayerState& state,
+    const GameCameraState& camState,
+    bool forceHideIcon,
+    bool forceHideEverything,
+    bool noCulling
+) {
+    using namespace $unity;
+
+    if (lerpDebug()) {
+        this->updateLerpTrajectory(data);
+    }
+
+    bool changedGravity = m_prevUpsideDown != data.isUpsideDown;
+
+    m_prevRotating = data.isRotating;
+    m_prevPosition = data.position;
+    m_prevRotation = data.rotation;
+    m_prevUpsideDown = data.isUpsideDown;
+
+    // set some PlayerObject members
+
+    m_isGoingLeft = data.isLookingLeft;
+    m_isDead = state.isDead;
+    m_isUpsideDown = data.isUpsideDown;
+    m_isOnGround = data.isGrounded;
+    m_isHolding = data.isHolding;
+    // m_isRotating = data.isRotating;
+    // m_isSideways = data.isSideways;
+
+    // m_isShip = data.iconType == PlayerIconType::Ship;
+    // m_isBall = data.iconType == PlayerIconType::Ball;
+    // m_isBird = data.iconType == PlayerIconType::Ufo;
+    // m_isDart = data.iconType == PlayerIconType::Wave;
+    // m_isRobot = data.iconType == PlayerIconType::Robot;
+    // m_isSpider = data.iconType == PlayerIconType::Spider;
+    // m_isSwing = data.iconType == PlayerIconType::Swing;
+
+    if (data.extData) {
+        auto& ed = *data.extData;
+        m_platformerXVelocity = ed.velocityX;
+        m_yVelocity = ed.velocityY;
+        m_isAccelerating = ed.accelerating;
+        m_accelerationOrSpeed = ed.acceleration;
+        m_fallStartY = ed.fallStartY;
+        m_isOnGround2 = ed.isOnGround2;
+        m_gravityMod = ed.gravityMod;
+        m_gravity = ed.gravity;
+        m_touchedPad = ed.touchedPad;
+        m_maybeIsFalling = ed.maybeFalling;
+        m_fallSpeed = ed.fallSpeed;
+        m_isOnGround4 = ed.isOnGround4;
+    }
+
+    // calculate visibility n stuff
+
+    if (!m_isDead) {
+        m_playingDeathEffect = false;
+    }
+
+    bool isNearby = noCulling ? true : this->isPlayerNearby(data, camState);
+
+    bool cameNearby = isNearby && !m_prevNearby;
+    m_prevNearby = isNearby;
+
+    // determine if the player should be visible
+    bool shouldMiscVisible = !forceHideEverything;
+    bool shouldIconVisible = !forceHideIcon && !forceHideEverything;
+
+    if (state.isPracticing && g_settings.hidePracticing) {
+        shouldIconVisible = shouldMiscVisible = false;
+    } else if (!forceHideEverything) {
+        shouldMiscVisible = ((data.isVisible && !m_playingDeathEffect) || g_settings.forceVisibility) && isNearby;
+        if (!forceHideIcon) {
+            shouldIconVisible = shouldMiscVisible;
+        }
+    }
+
+    bool anyVisible = shouldIconVisible || shouldMiscVisible;
+    this->setVisible(shouldIconVisible, shouldMiscVisible);
+    if (!anyVisible) {
+        m_playEffects = false;
+        if (m_regularTrail) m_regularTrail->setVisible(false);
+        if (m_shipStreak) m_shipStreak->setVisible(false);
+    }
+
+    bool extraProcessing = anyVisible || m_isLocalPlayer || noCulling;
+
+    // XXX: sticky is pretty broken so not handled
+
+    float innerRot = data.isSideways ? -90.f : 0.f;
+
+    float distanceTo90deg = std::fmod(std::abs(data.rotation), 90.f);
+    if (distanceTo90deg > 45.f) {
+        distanceTo90deg = 90.f - distanceTo90deg;
+    }
+
+    auto gjbgl = GLOBED_LAZY(GlobedGJBGL::get());
+
+    if (extraProcessing) {
+        this->setPosition(data.position);
+        this->setRotation(data.rotation);
+        m_mainLayer->setRotation(innerRot);
+
+        // rotate the name label together with the camera
+        bool rotateNames = g_settings.rotateNames;
+        CameraDirection dir{};
+
+        if (rotateNames && *gjbgl) {
+            dir = gjbgl->getCameraDirection();
+        } else {
+            dir.vector = CCPoint{0.f, 1.f};
+            dir.angle = 0.f;
+        }
+
+        m_nameLabel->setPosition(data.position + dir.vector * NAME_OFFSET);
+        m_nameLabel->setRotation(dir.angle);
+
+        if (m_emoteBubble && m_emoteBubble->isPlaying()) {
+            float yoffUp = (m_nameLabel->isVisible() ? STATUS_ICONS_OFFSET : NAME_OFFSET) - 4.f;
+            float yoffDown = NAME_OFFSET - 8.f;
+            float xoff = 22.f;
+
+            CCPoint dirVecPerp{dir.vector.y, -dir.vector.x};
+            CCPoint fullOffset = dir.vector * yoffUp + dirVecPerp * xoff;
+            CCPoint anchor{0.f, 0.f};
+
+            // if the player is somewhere near the ceiling, the emote bubble should be rendered on the opposite side,
+            // so that it's not inside the ceiling
+            bool invertY = false;
+            auto ceiling = gjbgl->m_groundLayer2;
+            if (ceiling && ceiling->isVisible()) {
+                float maxY = ceiling->getPositionY() - m_parentLayer->getPositionY();
+
+                // invert if 30% of the bubble is inside the ceiling
+                float bubbleTop = data.position.y + fullOffset.y +
+                    m_emoteBubble->getContentHeight() * std::abs(m_emoteBubble->getScaleY()) * 0.7f;
+
+                invertY = bubbleTop > maxY;
+            }
+
+            if (invertY) {
+                anchor.y = 1.f;
+                fullOffset = dir.vector * -yoffDown + dirVecPerp * xoff;
+            }
+
+            m_emoteBubble->setPosition(data.position + fullOffset);
+            m_emoteBubble->setRotation(dir.angle);
+            m_emoteBubble->setAnchorPoint(anchor);
+            m_emoteBubble->flipBubble(invertY);
+        }
+
+        if (m_statusIcons) {
+            m_statusIcons->setPosition(data.position + dir.vector * (m_nameLabel->isVisible() ? STATUS_ICONS_OFFSET : NAME_OFFSET));
+            m_statusIcons->setRotation(dir.angle);
+        }
+    }
+
+    if (data.isRotating || distanceTo90deg > 1.f) {
+        this->cancelPlatformerJumpAnim();
+    }
+
+    bool updatedOpacity = false;
+    if (!state.isDead && this->getOpacity() == 0) {
+        this->updateOpacity();
+        updatedOpacity = true;
+    }
+
+    m_startPosition = data.position;
+    m_lastPosition = data.position;
+    m_positionX = data.position.x;
+    m_positionY = data.position.y;
+
+    // update scale
+    if (m_prevMini != data.isMini) {
+        m_prevMini = data.isMini;
+        this->togglePlayerScale(data.isMini, true);
+        this->updatePlayerScale(); // sets scale x and y to vehicle size
+    }
+
+    // setFlipX doesn't work here for jetpack and stuff
+    m_mainLayer->setScaleX(m_isGoingLeft ? -1.0f : 1.0f);
+    m_mainLayer->setScaleY(data.isFlipped ? -1.0f : 1.0f);
+
+    bool switchedMode = data.iconType != m_prevMode;
+    bool turningOffSwing = (data.iconType == PlayerIconType::Swing && switchedMode);
+    bool turningOffRobot = (data.iconType == PlayerIconType::Robot && switchedMode);
+    bool flippedShip = changedGravity && data.iconType == PlayerIconType::Ship;
+
+    // ship has some funny display bugs if we don't update icon type after changing gravity
+    if (switchedMode || flippedShip) {
+        this->updateIconType(data.iconType);
+        m_prevMode = data.iconType;
+    }
+
+    if ((switchedMode || (isNearby && this->hideNearby(*gjbgl))) && !updatedOpacity) {
+        this->updateOpacity();
+        updatedOpacity = true;
+    }
+
+    if (m_statusIcons && extraProcessing) {
+        auto& am = AudioManager::get();
+        bool speaking = m_isLocalPlayer ? am.isPassiveRecording() : gjbgl->isSpeaking(state.accountId);
+
+        PlayerStatusFlags flags = {};
+        flags.paused = state.isPaused;
+        flags.practicing = m_isLocalPlayer ? false : state.isPracticing;
+        flags.speaking = speaking;
+        flags.speakingMuted = m_isLocalPlayer ? speaking && gjbgl->isUnableToSpeak() : false;
+        flags.editing = m_isLocalPlayer ? false : state.isInEditor;
+        m_statusIcons->updateStatus(flags);
+    }
+
+    // TODO (low): dashing
+
+    // animate robot and spider
+    if (data.iconType == PlayerIconType::Robot || data.iconType == PlayerIconType::Spider) {
+        if (m_prevGrounded != data.isGrounded || m_prevStationary != data.isStationary || m_prevFalling != data.isFalling || switchedMode || cameNearby) {
+            m_prevGrounded = data.isGrounded;
+            m_prevStationary = data.isStationary;
+            m_prevFalling = data.isFalling;
+
+            if (shouldIconVisible) {
+                data.iconType == PlayerIconType::Robot ?
+                    this->updateRobotAnimation()
+                    : this->updateSpiderAnimation();
+            }
+        }
+    }
+    // animate swing fire
+    else if (data.iconType == PlayerIconType::Swing) {
+        // if we just switched to swing, enable all fires
+        if (switchedMode) {
+            m_swingFireTop->setVisible(true);
+            m_swingFireMiddle->setVisible(true);
+            m_swingFireBottom->setVisible(true);
+
+            m_swingFireMiddle->animateFireIn();
+        }
+
+        if (cameNearby || ((changedGravity || switchedMode) && isNearby)) {
+            // now depending on the gravity, toggle either the bottom or top fire
+            this->animateSwingFire(!data.isUpsideDown);
+        }
+    }
+    // remove swing fire
+    else if (turningOffSwing) {
+        m_swingFireTop->setVisible(false);
+        m_swingFireMiddle->setVisible(false);
+        m_swingFireBottom->setVisible(false);
+    }
+    // remove robot fire
+    else if (turningOffRobot) {
+        if (shouldIconVisible) {
+            this->animateRobotFire(false);
+        } else {
+            // just hide the fire
+            this->hideRobotFire();
+        }
+    }
+
+    if (m_prevPaused != state.isPaused) {
+        m_prevPaused = state.isPaused;
+
+        if (state.isPaused) {
+            CCNode::onExit();
+        } else {
+            CCNode::onEnter();
+        }
+    }
+}
+
+void VisualPlayer::updateLerpTrajectory(const PlayerObjectData& data) {
+    if (!m_playerTrajectory) {
+        return;
+    }
+
+    m_playerTrajectory->drawSegment(
+        m_prevPosition, data.position,
+        0.5f,
+        ccColor4F{0.f, 1.f, 0.1f, 1.f}
+    );
+
+    auto& interpolator = GlobedGJBGL::get()->m_fields->m_interpolator;
+    int accountId = m_remotePlayer->m_state.accountId;
+
+    if (interpolator.hasPlayer(accountId)) {
+        auto& newstate = interpolator.getNewerState(m_remotePlayer->m_state.accountId);
+
+        m_playerTrajectory->drawCircle(
+            m_isSecond ? (newstate.player2 ? newstate.player2->position : CCPoint{}) : newstate.player1->position,
+            1.5f,
+            ccColor4F{0.1f, 0.9f, 0.2f, 1.f},
+            0.3f,
+            ccColor4F{1.f, 0.f, 0.f, 0.f},
+            8
+        );
+    }
+
+    // detect if the player reset
+    if (ccpDistance(m_prevPosition, data.position) > 50.f && data.position.x < m_prevPosition.x) {
+        m_playerTrajectory->clear();
+    }
+}
+
+bool VisualPlayer::hideNearby(GJBaseGameLayer* gjbgl) {
+    // if this is the local player, do nothing
+    if (m_isLocalPlayer) {
+        return false;
+    }
+
+    return gjbgl->m_level->isPlatformer()
+        ? $unity::g_settings.hideNearbyPlat
+        : $unity::g_settings.hideNearbyClassic;
+}
+
+PlayerIconData& VisualPlayer::icons() {
+    return m_remotePlayer->m_data.icons;
+}
+
+PlayerDisplayData& VisualPlayer::displayData() {
+    return m_remotePlayer->m_data;
+}
+
+RemotePlayer* VisualPlayer::getRemotePlayer() {
+    return m_remotePlayer;
+}
+
+bool VisualPlayer::isHolding() {
+    return m_isHolding;
+}
+
+void VisualPlayer::setStickyState(bool p1, bool sticky) {
+    if (p1) {
+        m_p1Sticky = sticky;
+    } else {
+        m_p2Sticky = sticky;
+    }
+}
+
+void VisualPlayer::updateOpacity() {
+    float mult = 1.f;
+
+    auto gjbgl = GlobedGJBGL::get(m_gameLayer);
+    bool hideNearby_ = this->hideNearby(gjbgl);
+
+    if (hideNearby_ && !gjbgl->isSpectating()) {
+        // calculate distance
+        auto p1pos = m_gameLayer->m_player1->getPosition();
+        auto p2pos = m_gameLayer->m_player2->getPosition();
+        auto ourPos = m_prevPosition;
+
+        float distance = std::min(
+            cocos2d::ccpDistance(ourPos, p1pos),
+            cocos2d::ccpDistance(ourPos, p2pos)
+        );
+
+        // range of 150 units (5 blocks)
+        distance = std::clamp(distance, 0.f, 150.f);
+        mult = distance / 150.f;
+    }
+
+    uint8_t opacity = static_cast<uint8_t>($unity::g_settings.playerOpacity * mult * 255.f);
+
+    this->setOpacity(opacity);
+    m_spiderSprite->GJRobotSprite::setOpacity(opacity);
+    m_robotSprite->GJRobotSprite::setOpacity(opacity);
+    if (m_shipStreak) {
+        m_shipStreak->setOpacity(opacity);
+    }
+    if (m_regularTrail) {
+        m_regularTrail->setOpacity(opacity);
+    }
+
+    // set name opacity as well if hide nearby is enabled
+    if (hideNearby_) {
+        m_nameLabel->updateOpacity(opacity);
+
+        if (m_emoteBubble) {
+            m_emoteBubble->setOpacityMult(mult);
+        }
+
+        if (m_statusIcons) {
+            m_statusIcons->setOpacity(opacity);
+        }
+    }
+}
+
+/// Updates the actual displayed gamemode, unlike `callUpdate`, which may update the texture without changing the gamemode
+void VisualPlayer::updateIconType(PlayerIconType iconType) {
+    auto& icons = this->icons();
+
+    this->toggleFlyMode(false, true);
+    this->toggleRollMode(false, false);
+    this->toggleBirdMode(false, false);
+    this->toggleDartMode(false, false);
+    this->toggleRobotMode(false, false);
+    this->toggleSpiderMode(false, false);
+    this->toggleSwingMode(false, false);
+
+    switch (iconType) {
+        case PlayerIconType::Unknown:
+        case PlayerIconType::Cube: break;
+
+        case PlayerIconType::Ship: {
+            this->toggleFlyMode(true, false);
+        } break;
+        case PlayerIconType::Ball: {
+            this->toggleRollMode(true, false);
+        } break;
+        case PlayerIconType::Ufo: {
+            this->toggleBirdMode(true, false);
+        } break;
+        case PlayerIconType::Wave: {
+            this->toggleDartMode(true, false);
+        } break;
+        case PlayerIconType::Robot: {
+            this->toggleRobotMode(true, false);
+        } break;
+        case PlayerIconType::Spider: {
+            this->toggleSpiderMode(true, false);
+        } break;
+        case PlayerIconType::Swing: {
+            this->toggleSwingMode(true, false);
+        } break;
+        case PlayerIconType::Jetpack: {
+            this->toggleFlyMode(true, true);
+        } break;
+    }
+
+    this->callUpdate(icons, iconType);
+
+    this->updateGlowColor();
+    this->updatePlayerGlow();
+}
+
+void VisualPlayer::callUpdate(PlayerIconData& icons, PlayerIconType ty) {
+    bool doMini = m_defaultMiniIcon && m_prevMini;
+
+    switch (ty) {
+        case PlayerIconType::Unknown:
+        case PlayerIconType::Cube: break; // handled later
+        case PlayerIconType::Ship: {
+            this->updatePlayerShipFrame(icons.ship);
+        } break;
+        case PlayerIconType::Ball: {
+            this->updatePlayerRollFrame(doMini ? 0 : icons.ball);
+        } break;
+        case PlayerIconType::Ufo: {
+            this->updatePlayerBirdFrame(icons.ufo);
+        } break;
+        case PlayerIconType::Wave: {
+            this->updatePlayerDartFrame(icons.wave);
+        } break;
+        case PlayerIconType::Robot: {
+            this->updatePlayerRobotFrame(icons.robot);
+        } break;
+        case PlayerIconType::Spider: {
+            this->updatePlayerSpiderFrame(icons.spider);
+        } break;
+        case PlayerIconType::Swing: {
+            this->updatePlayerSwingFrame(icons.swing);
+        } break;
+        case PlayerIconType::Jetpack: {
+            this->updatePlayerJetpackFrame(icons.jetpack);
+        } break;
+    }
+
+    // if we are switching to cube or a mode with a passenger, we always call updatePlayerFrame
+    if (ty == PlayerIconType::Cube || ty == PlayerIconType::Ship || ty == PlayerIconType::Ufo || ty == PlayerIconType::Jetpack) {
+        this->updatePlayerFrame(doMini ? 0 : icons.cube);
+    }
+}
+
+void VisualPlayer::updateRobotAnimation() {
+    if (m_prevGrounded && m_prevStationary) {
+        // if on ground and not moving, play the idle animation
+        m_robotSprite->tweenToAnimation("idle01", 0.3f);
+        this->animateRobotFire(false);
+    } else if (m_prevGrounded && !m_prevStationary) {
+        // if on ground and moving, play the running animation
+        m_robotSprite->tweenToAnimation("run", 0.1f);
+        this->animateRobotFire(false);
+    } else if (m_prevFalling) {
+        // if in the air and falling, play falling animation
+        m_robotSprite->tweenToAnimation("fall_loop", 0.1f);
+        this->animateRobotFire(false);
+    } else if (!m_prevFalling) {
+        // if in the air and not falling, play jumping animation
+        m_robotSprite->tweenToAnimation("jump_loop", 0.1f);
+        this->animateRobotFire(true);
+    }
+}
+
+void VisualPlayer::updateSpiderAnimation() {
+    // this is practically the same as the robot animation
+
+    if (!m_prevGrounded && m_prevFalling) {
+        m_spiderSprite->tweenToAnimation("fall_loop", 0.1f);
+    } else if (!m_prevGrounded && !m_prevFalling) {
+        m_spiderSprite->tweenToAnimation("jump_loop", 0.1f);
+    } else if (m_prevGrounded && m_prevStationary) {
+        m_spiderSprite->tweenToAnimation("idle01", 0.3f);
+    } else if (m_prevGrounded && !m_prevStationary) {
+        m_spiderSprite->tweenToAnimation("run", 0.1f);
+    }
+}
+
+void VisualPlayer::animateSwingFire(bool goingDown) {
+    if (goingDown) {
+        m_swingFireTop->animateFireIn();
+        m_swingFireBottom->animateFireOut();
+    } else {
+        m_swingFireTop->animateFireOut();
+        m_swingFireBottom->animateFireIn();
+    }
+}
+
+void VisualPlayer::animateRobotFire(bool enable) {
+    m_robotFire->stopActionByTag(ROBOT_FIRE_ACTION);
+
+    CCSequence* seq;
+    if (enable) {
+        seq = CCSequence::create(
+            CCDelayTime::create(0.15f),
+            CCCallFunc::create(this, callfunc_selector(VisualPlayer::showRobotFire)),
+            nullptr
+        );
+
+        m_robotFire->setVisible(true);
+    } else {
+        seq = CCSequence::create(
+            CCDelayTime::create(0.1f),
+            CCCallFunc::create(this, callfunc_selector(VisualPlayer::hideRobotFire)),
+            nullptr
+        );
+
+        m_robotFire->animateFireOut();
+    }
+
+    seq->setTag(ROBOT_FIRE_ACTION);
+    m_robotFire->runAction(seq);
+}
+
+void VisualPlayer::hideRobotFire() {
+    m_robotFire->setVisible(false);
+}
+
+void VisualPlayer::showRobotFire() {
+    m_robotFire->animateFireIn();
+}
+
+void VisualPlayer::cleanupObjectLayer() {
+#define $clear(x) if (x) x->removeFromParent(); x = nullptr
+
+    // Robtop does not properly remove most/all those nodes from the playerobject in the destructor,
+    // so whenever someone leaves the level, these nodes are never deleted until you leave the level too.
+
+    // Thanks sleepyut for finding this :)
+
+    $clear(m_shipStreak);
+    $clear(m_regularTrail);
+    $clear(m_waveTrail);
+    $clear(m_ghostTrail);
+
+    $clear(m_playerGroundParticles);
+    $clear(m_trailingParticles);
+    $clear(m_shipClickParticles);
+    $clear(m_vehicleGroundParticles);
+    $clear(m_ufoClickParticles);
+    $clear(m_robotBurstParticles);
+    $clear(m_dashParticles);
+    $clear(m_swingBurstParticles1);
+    $clear(m_swingBurstParticles2);
+    $clear(m_landParticles0);
+    $clear(m_landParticles1);
+
+    // hope i didnt forget anything..
+
+    // custom nodes
+    $clear(m_statusIcons);
+    $clear(m_playerTrajectory);
+
+    // these two are non refs so we have to be careful, if playernode is already destroyed don't touch them
+    if (m_playerNode.valid()) {
+        $clear(m_nameLabel);
+        $clear(m_emoteBubble);
+    }
+
+#undef $clear
+}
+
+void VisualPlayer::updateDisplayData() {
+    auto gm = singleton<GameManager>();
+    auto& rm = RoomManager::get();
+    auto& ddata = this->displayData();
+
+    // update the team if not initialized
+    if (!m_teamInitialized) {
+        if (auto id = rm.getTeamIdForPlayer(ddata.accountId)) {
+            this->updateTeam(*id);
+        }
+    }
+
+    m_nameLabel->updateName(ddata.username);
+    m_nameLabel->updateOpacity($unity::g_settings.nameOpacity);
+    if (ddata.specialUserData) {
+        m_nameLabel->updateWithRoles(*ddata.specialUserData);
+    }
+}
+
+void VisualPlayer::updateIcons() {
+    this->updatePlayerObjectIcons(false);
+    this->updateIconType(m_prevMode);
+}
+
+void VisualPlayer::updateTeam(uint16_t teamId) {
+    if (auto team = RoomManager::get().getTeam(teamId)) {
+        m_nameLabel->updateTeam(teamId, team->color);
+        m_teamInitialized = true;
+    }
+}
+
+void VisualPlayer::playDeathEffect() {
+    // do nothing if the player is not nearby or in editor
+    if (!m_prevNearby || m_isEditor) return;
+
+    this->hideRobotFire();
+
+    auto* gm = globed::singleton<GameManager>();
+
+    int oldEffect = gm->getPlayerDeathEffect();
+    int newEffect = this->icons().deathEffect;
+
+    // prevent a crash here if this effect hasn't fully loaded yet; use default as fallback
+    if (newEffect != 1 && !PreloadManager::get().deathEffectLoaded(newEffect)) {
+        newEffect = 1;
+    }
+
+    gm->setPlayerDeathEffect(newEffect);
+
+    // find all children in the object layer so we can later compare and see what nodes were added by playerDestroyed
+    auto children = m_gameLayer->m_objectLayer->getChildrenExt();
+    std::unordered_set<CCNode*> prevChildren{children.begin(), children.end()};
+
+    // cause the actual death
+    m_playEffects = true;
+    m_isHidden = false;
+    this->playerDestroyed(false);
+
+    // set the death effect tag to every new child
+    for (auto child : children) {
+        if (!prevChildren.contains(child)) {
+            child->setTag(DEATH_EFFECT_TAG);
+        }
+    }
+
+    gm->setPlayerDeathEffect(oldEffect);
+
+    m_playingDeathEffect = true;
+}
+
+void VisualPlayer::handleSpiderTp(const SpiderTeleportData& tp) {
+    auto pl = globed::singleton<GameManager>()->m_playLayer;
+    if (!pl || !m_prevNearby) return;
+
+    m_playEffects = true;
+    this->stopActionByTag(SPIDER_TELEPORT_COLOR_ACTION);
+
+    auto arr = pl->m_circleWaveArray;
+    size_t countBefore = arr ? arr->count() : 0;
+    this->playSpiderDashEffect(tp.from, tp.to);
+    size_t countAfter = arr ? arr->count() : 0;
+
+    for (size_t i = countBefore; i < countAfter; i++) {
+        static_cast<CCNode*>(arr->objectAtIndex(i))->setTag(SPIDER_DASH_CIRCLE_WAVE_TAG);
+    }
+
+    m_tpColorDelta = 0.f;
+    this->spiderTeleportUpdateColor();
+
+    // mark other sprites with a tag
+
+    auto sfc = singleton<CCSpriteFrameCache>();
+    auto sframe = sfc->spriteFrameByName("spiderDash_001.png");
+    if (!sframe) return;
+
+    auto* spdash1 = sframe->getTexture();
+    for (auto child : m_parentLayer->getChildrenExt()) {
+        if (child->getZOrder() != 40) continue;
+        if (!child->getID().empty()) continue;
+
+        auto sprite = typeinfo_cast<CCSprite*>(child);
+        if (!sprite) continue;
+
+        auto* tex = sprite->getTexture();
+
+        if (tex == spdash1) {
+            sprite->setTag(SPIDER_DASH_SPRITE_TAG);
+        }
+    }
+}
+
+static inline ccColor3B lerpColor(ccColor3B from, ccColor3B to, float delta) {
+    delta = std::clamp(delta, 0.f, 1.f);
+
+    ccColor3B out;
+    out.r = std::lerp(from.r, to.r, delta);
+    out.g = std::lerp(from.g, to.g, delta);
+    out.b = std::lerp(from.b, to.b, delta);
+
+    return out;
+}
+
+void VisualPlayer::spiderTeleportUpdateColor() {
+    constexpr float MAX_TIME = 0.4f;
+
+    m_tpColorDelta += (1.f / 60.f);
+
+    float delta = m_tpColorDelta / MAX_TIME;
+
+    if (delta >= 1.f) {
+        this->stopActionByTag(SPIDER_TELEPORT_COLOR_ACTION);
+        this->setColor(m_color1);
+        this->setSecondColor(m_color2);
+        return;
+    }
+
+    auto main = lerpColor(ccColor3B{255, 255, 255}, m_color1, delta);
+    auto secondary = lerpColor(ccColor3B{255, 255, 255}, m_color2, delta);
+
+    this->setColor(main);
+    this->setSecondColor(secondary);
+
+    auto* seq = CCSequence::create(
+        CCDelayTime::create(1.f / 60.f),
+        CCCallFunc::create(this, callfunc_selector(VisualPlayer::spiderTeleportUpdateColor)),
+        nullptr
+    );
+    seq->setTag(SPIDER_TELEPORT_COLOR_ACTION);
+
+    this->runAction(seq);
+}
+
+void VisualPlayer::playPlatformerJump() {
+    if (!m_prevNearby) return;
+
+    if (m_isPlatformer && m_prevMode == PlayerIconType::Cube && !m_prevRotating) {
+        this->animatePlatformerJump(1.f);
+        m_didPlatformerJump = true;
+    }
+}
+
+void VisualPlayer::playEmote(uint32_t emoteId) {
+    if (!m_emoteBubble) {
+        m_emoteBubble = Build<EmoteBubble>::create()
+            .parent(m_remotePlayer->m_parentNode);
+    }
+
+    m_emoteBubble->playEmote(emoteId, m_remotePlayer->shared_from_this());
+}
+
+void VisualPlayer::cancelPlatformerJumpAnim() {
+    if (m_didPlatformerJump) {
+        m_didPlatformerJump = false;
+        this->stopPlatformerJumpAnimation();
+    }
+}
+
+void VisualPlayer::updatePlayerObjectIcons(bool skipFrames) {
+    auto* gm = globed::singleton<GameManager>();
+    auto& icons = this->icons();
+
+    m_color1 = icons.color1.asColor();
+    m_color2 = icons.color2.asColor();
+    if (m_isSecond) {
+        std::swap(m_color1, m_color2);
+    }
+
+    m_defaultMiniIcon = icons.defaultMini;
+
+    this->setColor(m_color1);
+    this->setSecondColor(m_color2);
+
+    if (!icons.glowColor.isNone()) {
+        this->m_hasGlow = true;
+        this->enableCustomGlowColor(icons.glowColor.asColor());
+    } else {
+        this->m_hasGlow = false;
+        this->disableCustomGlowColor();
+    }
+
+    if (!skipFrames) {
+        this->callUpdate(icons, PlayerIconType::Cube);
+        this->callUpdate(icons, PlayerIconType::Ship);
+        this->callUpdate(icons, PlayerIconType::Ball);
+        this->callUpdate(icons, PlayerIconType::Ufo);
+        this->callUpdate(icons, PlayerIconType::Wave);
+        this->callUpdate(icons, PlayerIconType::Robot);
+        this->callUpdate(icons, PlayerIconType::Spider);
+        this->callUpdate(icons, PlayerIconType::Swing);
+        this->callUpdate(icons, PlayerIconType::Jetpack);
+    }
+
+    this->updateGlowColor();
+    this->updatePlayerGlow();
+
+    // set opacities
+    this->updateOpacity();
+}
+
+bool VisualPlayer::isPlayerNearby(const PlayerObjectData& data, const GameCameraState& camState) {
+    // always render them in editor (cause im lazy)
+    if (m_isEditor) return true;
+
+    // check if they are inside a grid of 3x3 screens
+    float fullScaleMult = 3.f;
+    float originMoveMult = (fullScaleMult - 1.f) / 2.f; // magic
+
+    CCSize origCoverage = camState.cameraCoverage();
+    CCSize cameraCoverage = origCoverage * fullScaleMult;
+    CCPoint cameraOrigin = camState.cameraOrigin - origCoverage * originMoveMult;
+
+    float cameraLeft = cameraOrigin.x;
+    float cameraRight = cameraOrigin.x + cameraCoverage.width;
+    float cameraBottom = cameraOrigin.y;
+    float cameraTop = cameraOrigin.y + cameraCoverage.height;
+
+    auto& pos = data.position;
+
+    return pos.x >= cameraLeft && pos.x <= cameraRight &&
+           pos.y >= cameraBottom && pos.y <= cameraTop;
+}
+
+CCPoint VisualPlayer::getLastPosition() {
+    return m_prevPosition;
+}
+
+float VisualPlayer::getLastRotation() {
+    return m_prevRotation;
+}
+
+void VisualPlayer::setVisible(bool icon, bool misc) {
+    auto gjbgl = GlobedGJBGL::get(m_gameLayer);
+
+    if (icon != m_bVisible) {
+        // this function has some overhead on every call, don't call if not needed
+        PlayerObject::setVisible(icon);
+    }
+
+    // show things if player is visible or if it's the ghost player, not in editor and not spectating
+    // bool actuallyShow = vis || (m_isLocalPlayer && !m_isEditor && !gjbgl->isSpectating());
+
+    m_nameLabel->setVisible(misc && !m_forceHideName);
+    if (m_statusIcons) m_statusIcons->setVisible(misc);
+    if (m_emoteBubble) m_emoteBubble->setVisible(misc);
+}
+
+void VisualPlayer::setVisible(bool vis) {
+    this->setVisible(vis, vis);
+}
+
+bool VisualPlayer::isVisible() {
+    return m_bVisible;
+}
+
+VisualPlayer* VisualPlayer::create(GJBaseGameLayer* gameLayer, RemotePlayer* rp, CCNode* playerNode, bool isSecond, bool localPlayer) {
+    auto data = operator new(sizeof(VisualPlayer));
+    std::memset(data, 0, sizeof(VisualPlayer));
+
+    // PlayerObject members are initialized in the ctor
+    // GameObject members are initialized in the ctor
+    // CCSpritePlus members are zero-initialized
+    // CCSprite members need initialization
+    auto spr = new (data) CCSprite();
+    auto ret = std::launder<VisualPlayer>(new (data) VisualPlayer());
+
+    if (ret->init(gameLayer, rp, playerNode, isSecond, localPlayer)) {
+        ret->autorelease();
+        return ret;
+    }
+
+    delete ret;
+    return nullptr;
+}
+
+struct GLOBED_MODIFY_ATTR VPSchedulerHook : Modify<VPSchedulerHook, CCScheduler> {
+    void scheduleUpdateForTarget(CCObject* target, int priority, bool paused) {
+        if ($unity::g_changeParticleUpdate) priority = 0;
+
+        CCScheduler::scheduleUpdateForTarget(target, priority, paused);
+    }
+};
+
+}
+
+// Note for self after reversing PlayerObject:
+// - Switching to another mode is done via toggleXXXMode(true, false), and then updatePlayerXXXFrame
+// - Switching to variants with passengers (ufo, ship) also seems to call updatePlayerFrame afterwards
+// - update frame methods do the following:
+// 1. clamp icon id and call GameManager::loadIcon
+// 2. obtain sprite frames from the cache and set them to the appropriate sprites
+// 3. sometimes call extra funcs, e.g. updatePlayerSpriteExtra
+// - toggle methods do the following:
+// 1. bail out if the same mode already
+// 2. call switchedToMode (which toggles all modes off?)
+// 3. calls other stuff like updating frames, doing stuff with streaks/particles

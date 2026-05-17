@@ -1,0 +1,1536 @@
+#include "GJBaseGameLayer.hpp"
+#include <globed/audio/AudioManager.hpp>
+#include <globed/core/RoomManager.hpp>
+#include <globed/core/PlayerCacheManager.hpp>
+#include <globed/core/SettingsManager.hpp>
+#include <globed/core/PopupManager.hpp>
+#include <globed/core/EmoteManager.hpp>
+#include <globed/core/FriendListManager.hpp>
+#include <globed/util/algo.hpp>
+#include <globed/util/gd.hpp>
+#include <globed/util/FunctionQueue.hpp>
+#include <globed/util/GameState.hpp>
+#include <core/CoreImpl.hpp>
+#include <core/preload/PreloadManager.hpp>
+#include <core/net/NetworkManagerImpl.hpp>
+#include <core/game/SettingCache.hpp>
+#include <ui/settings/DiscordLinkPopup.hpp>
+
+#include <Geode/modify/GameObject.hpp>
+#include <Geode/loader/GameEvent.hpp>
+#include <Geode/loader/SettingV3.hpp>
+#include <Geode/utils/VMTHookManager.hpp>
+#include <UIBuilder.hpp>
+#include <asp/time/Instant.hpp>
+#include <asp/iter.hpp>
+#include <qunet/util/algo.hpp>
+#include <cue/Util.hpp>
+
+using namespace geode::prelude;
+using namespace asp::time;
+
+constexpr auto EMOTE_COOLDOWN = Duration::fromMillis(2500);
+static constexpr bool APPLY_PERCENTAGE_FIX = true;
+
+namespace globed {
+
+static auto& g_settings = CachedSettings::get();
+
+static std::optional<Instant> g_lastEmoteTime;
+static struct {
+    Instant start;
+    Instant postLerp;
+    Instant postRPUpdate;
+    Instant postAudioUpdate;
+    Instant postPreUpdateEnd;
+
+    Instant postGameUpdate;
+    Instant postSendPlayerData;
+    Instant postPeriodicalUpdate;
+    Instant postPostUpdateEnd;
+} g_profilerFrame;
+
+static int myAccountId() {
+    return singleton<GJAccountManager>()->m_accountID;
+}
+
+GlobedGJBGL::Fields::~Fields() {
+    if (m_self && m_active) {
+        this->cleanup();
+    }
+}
+
+void GlobedGJBGL::Fields::cleanup() {
+    auto& am = AudioManager::get();
+    am.haltRecording();
+    am.stopAllOutputSources();
+
+    if (!m_active) {
+        return;
+    }
+
+    m_active = false;
+    m_cleanedUp = true; // don't do any extra cleanup if quitting
+
+    CoreImpl::get().onLeaveLevel(m_self, m_editor);
+    RoomManager::get().leaveLevel();
+}
+
+void GlobedGJBGL::setupPreInit(GJGameLevel* level, bool editor) {
+    auto& fields = *m_fields.self();
+    auto& nm = NetworkManagerImpl::get();
+    fields.m_editor = editor;
+    fields.m_self = this;
+
+    g_settings.reload();
+
+    // determine if mulitplayer should be active
+
+    auto ecId = RoomManager::get().getEditorCollabId(level);
+    bool isEditorCollab = ecId && ecId->asU64() && ecId->asU64() != (uint64_t)level->m_levelID;
+
+    fields.m_active = nm.isConnected() && (level->m_levelID != 0 || isEditorCollab);
+    if (level->m_levelType == GJLevelType::Editor && !g_settings.editorEnabled) {
+        fields.m_active = false;
+    }
+
+    fields.m_interpolator.setPlatformer(level->isPlatformer());
+
+    // invalidate player icons so they are refreshed and new ones are sent to the server, if applicable
+    nm.invalidateIcons();
+
+    if (fields.m_active) {
+        RoomManager::get().joinLevel(level);
+        CoreImpl::get().onJoinLevel(this, level, editor);
+    }
+
+    // this should happen immediately after joining, otherwise we race on localhost
+    this->setupListeners();
+}
+
+void GlobedGJBGL::setupPostInit() {
+    auto& fields = *m_fields.self();
+    this->setupNecessary();
+
+    if (!fields.m_active) return;
+
+    // setup everything else
+    this->setupAssetLoading();
+    this->setupAudio();
+    this->setupUi();
+    this->setupKeybinds();
+
+    // add ghost player
+    fields.m_ghost = std::make_shared<RemotePlayer>(0, this, fields.m_playerNode);
+    this->updateLocalIcons(std::nullopt);
+
+    // disable culling if in editor
+    // TODO: maybe instead figure how to get the camera and radius
+    if (fields.m_editor) {
+        fields.m_noGlobalCulling = true;
+    }
+
+    CoreImpl::get().onJoinLevelPostInit(this);
+}
+
+void GlobedGJBGL::setupNecessary() {
+    auto& fields = *m_fields.self();
+
+    fields.m_pingOverlay = Build<PingOverlay>::create()
+        .scale(0.38f)
+        .zOrder(11)
+        .id("game-overlay"_spr);
+    fields.m_pingOverlay->addToLayer(this);
+
+    auto& nm = NetworkManagerImpl::get();
+    int levelId = m_level->m_levelID;
+
+    if (!nm.isConnected()) {
+        fields.m_pingOverlay->updateWithDisconnected();
+    } else if (!fields.m_active) {
+        fields.m_pingOverlay->updateWithEditor();
+    } else {
+        fields.m_pingOverlay->updatePing();
+    }
+}
+
+static std::pair<CCNode*, Label*> createLoadingOverlay() {
+    auto winSize = CCDirector::get()->getWinSize();
+    auto layer = CCLayerColor::create({0, 0, 0, 220}, winSize.width, winSize.height);
+    layer->ignoreAnchorPointForPosition(false);
+    layer->setAnchorPoint({0.f, 0.f});
+
+    auto progLabel = Build<Label>::create("Loading... (0 / 0)", "bigFont.fnt")
+        .scale(0.8f)
+        .parent(layer)
+        .pos(winSize.width / 2, winSize.height / 2)
+        .anchorPoint(0.5f, 0.5f);
+
+    auto lbl = Build(Label::create("Globed is currently loading player icons and death effects.\nThis is done to reduce stutters in-game, and can be disabled in settings.", "chatFont.fnt"))
+        .parent(layer)
+        .scale(0.7f)
+        .pos(winSize.width / 2, winSize.height / 2 - 50.f)
+        .anchorPoint(0.5f, 0.5f)
+        .collect();
+    lbl->setAlignment(BMFontAlignment::Center);
+
+    return {layer, progLabel};
+}
+
+void GlobedGJBGL::setupAssetLoading() {
+    auto& pm = PreloadManager::get();
+    pm.enterContext(PreloadContext::Level);
+
+    if (pm.shouldPreload()) {
+        log::info("Preloading assets (deferred)");
+
+        // show an overlay while the game is frozen and loading resources,
+        // so that the user knows what's going on
+        auto [ov, label] = createLoadingOverlay();
+        CCScene::get()->addChild(ov, 1000);
+
+        auto start = Instant::now();
+        pm.loadEverything(PreloadOptions {
+            .callback = [&](const PreloadProgress& prog) {
+                StringBuffer<> buf;
+                buf.append("Loading... ({} / {})", prog.totalLoaded, prog.totalCount);
+                label->setString(buf.view());
+                return true;
+            }
+        });
+
+        log::info("Asset preloading took {} ({} items loaded)", start.elapsed().toString(), pm.getLoadedCount());
+    }
+
+    pm.exitContext();
+}
+
+void GlobedGJBGL::setupAudio() {
+    auto& am = AudioManager::get();
+    am.stopAllOutputSources(); // preemptively
+    m_fields->m_audioInterval.setInterval(Duration::fromSecsF32(1.f / 30.f).value());
+
+#ifdef GLOBED_VOICE_CAN_TALK
+    if (g_settings.voiceChat) {
+        // set audio device
+        am.refreshDevices();
+        am.setRecordBufferCapacity(globed::setting<int>("core.audio.buffer-size"));
+
+        AudioRecordConfig config {
+            .encodedCallback = [this](const auto& frame) {
+                NetworkManagerImpl::get().sendVoiceData(frame);
+
+                if (g_settings.voiceLoopback && m_fields->m_ghost) {
+                    m_fields->m_ghost->playVoiceData(frame);
+                }
+            },
+            .passive = true,
+        };
+
+        am.startRecording(std::move(config));
+    }
+#endif
+
+    auto winSize = CCDirector::get()->getWinSize();
+
+    // enable voice proximity?
+    m_fields->m_isVoiceProximity = m_level->isPlatformer()
+        ? globed::setting<bool>("core.audio.voice-proximity")
+        : globed::setting<bool>("core.audio.classic-proximity");
+
+    // schedule voice overlay 1 frame later, when we have a scene
+    if (g_settings.voiceChat) {
+        FunctionQueue::get().queue([self = Ref(this), winSize] {
+            bool onTop = globed::setting<bool>("core.audio.overlaying-overlay");
+            CCNode* scene = self->getParent();
+            CCNode* parent = onTop && scene ? scene : self->m_uiLayer;
+
+            self->m_fields->m_voiceOverlay = Build<VoiceOverlay>::create()
+                .parent(parent)
+                .visible(globed::setting<bool>("core.level.voice-overlay"))
+                .zOrder(onTop ? 20 : 1)
+                .anchorPoint(1.f, 0.f)
+                .collect();
+
+            self->m_fields->m_voiceOverlay->reposition();
+        });
+    }
+}
+
+void GlobedGJBGL::setupUi() {
+    auto& fields = *m_fields.self();
+    auto winSize = CCDirector::get()->getWinSize();
+
+    Build<CCNode>::create()
+        .id("player-node"_spr)
+        .parent(m_objectLayer)
+        .store(fields.m_playerNode);
+
+    // gd PlayerObject is drawn on z 59, use 58 to appear on same in-game layer but behind the player
+    fields.m_playerNode->setZOrder(58);
+
+    fields.m_progressBarContainer = Build<CCNode>::create()
+        .id("progress-bar-wrapper"_spr)
+        .visible(globed::setting<bool>("core.level.progress-indicators"))
+        .zOrder(-1);
+
+    if (auto pl = this->asPlayLayer()) {
+        if (pl->m_progressBar) {
+            pl->m_progressBar->addChild(fields.m_progressBarContainer);
+        }
+    }
+
+    if (globed::setting<bool>("core.dev.profile-frame-time")) {
+        fields.m_profilerOverlay = Build<ProfilerOverlay>::create(CCSize{320.f, 80.f})
+            .id("profiler-overlay"_spr)
+            .anchorPoint(0.f, 0.f)
+            .pos(0.f, 0.f)
+            .zOrder(10)
+            .parent(m_uiLayer);
+    }
+}
+
+void GlobedGJBGL::setupListeners() {
+    auto& fields = *m_fields.self();
+    auto& nm = NetworkManagerImpl::get();
+
+    fields.m_levelDataListener = nm.listen<msg::LevelDataMessage>([this](const msg::LevelDataMessage& message) {
+        this->onLevelDataReceived(message);
+    });
+
+    fields.m_levelMetaListener = nm.listen<msg::LevelMetaMessage>([this](const msg::LevelMetaMessage& message) {
+        this->onLevelMetaReceived(message);
+    });
+
+    fields.m_voiceListener = nm.listen<msg::VoiceBroadcastMessage>([this](msg::VoiceBroadcastMessage& message) {
+        // skip processing completely if voice chat is off
+        if (!g_settings.voiceChat) return ListenerResult::Propagate;
+
+        this->onVoiceDataReceived(message);
+        return ListenerResult::Stop;
+    });
+
+    fields.m_quickChatListener = nm.listen<msg::QuickChatBroadcastMessage>([this](const msg::QuickChatBroadcastMessage& message) {
+        this->onQuickChatReceived(message.accountId, message.quickChatId);
+    });
+
+    fields.m_mutedListener = nm.listen<msg::ChatNotPermittedMessage>([this](const msg::ChatNotPermittedMessage& msg) {
+        log::warn("Unable to speak: voice = {}, reason = {}", msg.isVoice, (int)msg.reason);
+        if (!msg.isVoice) return;
+
+        auto& fields = *m_fields.self();
+
+        if (msg.reason == msg::ChatNotPermittedReason::NotLinked) {
+            fields.m_knownNotLinked = true;
+            this->maybeShowVCAlert(msg.reason);
+        } else {
+            fields.m_knownServerMuted = true;
+            this->maybeShowVCAlert(msg.reason);
+        }
+    });
+
+    fields.m_joinFailedListener = nm.listen<msg::JoinSessionFailedMessage>([this](const msg::JoinSessionFailedMessage& msg) {
+        this->onJoinSessionFailed(msg);
+    });
+
+    fields.m_discordStateListener = nm.listen<msg::DiscordLinkStateMessage>([this](const msg::DiscordLinkStateMessage& msg) {
+        if (msg.id != 0) {
+            // linked! :)
+            m_fields->m_knownNotLinked = false;
+        }
+    });
+}
+
+void GlobedGJBGL::maybeShowVCAlert(msg::ChatNotPermittedReason reason) {
+    auto& fields = *m_fields.self();
+
+    if (fields.m_showedMutedAlert) {
+        return;
+    }
+
+    PopupRef ref;
+
+    switch (reason) {
+        case msg::ChatNotPermittedReason::NotLinked: {
+            ref = PopupManager::get().quickPopup(
+                "Not Linked",
+
+                "In order to use <cy>voice chat</c> on Globed, you must open <cg>Globed settings</c> and link your <cb>Discord</c> account.\n\n"
+                "Do you want to link now?",
+
+                "No", "Yes",
+                [](auto, bool accepted) {
+                    if (!accepted) return;
+
+                    DiscordLinkPopup::create()->show();
+                }
+            );
+        } break;
+
+        case msg::ChatNotPermittedReason::Muted: {
+            ref = PopupManager::get().alert(
+                "Muted",
+
+                "You have been <cr>muted</c> by the server moderators, and cannot use voice chat.\n\n"
+                "This notice was shown because you tried to activate voice chat while muted."
+            );
+        } break;
+
+        case msg::ChatNotPermittedReason::LevelDisabled: {
+            ref = PopupManager::get().alert(
+                "Voice Chat Disabled",
+
+                "Voice chat is currently disabled in this level. This is a <cy>global</c> limitation for <cy>everybody</c> on this level, and it cannot be bypassed.\n\n"
+                "This notice was shown because you tried to activate voice chat while it was disabled."
+            );
+        } break;
+
+        // rest are usually temporary errors or cannot happen
+        default: return;
+    }
+
+    ref.showQueue();
+    fields.m_showedMutedAlert = true;
+}
+
+void GlobedGJBGL::updateLocalIcons(std::optional<PlayerIconData> icons) {
+    auto& fields = *m_fields.self();
+
+    auto ddata = PlayerDisplayData::getOwn();
+    if (icons) {
+        ddata.icons = *icons;
+    }
+
+    if (fields.m_ghost) {
+        fields.m_ghost->initData(ddata, false);
+    }
+}
+
+// temporary solution until we at geode come up with a non temporary solution
+static bool ignoreKeybind() {
+    return CCIMEDispatcher::sharedDispatcher()->hasDelegate();
+}
+
+void GlobedGJBGL::setupKeybinds() {
+    this->addEventListener(
+        KeybindSettingPressedEventV3(Mod::get(), "keybind-voice-chat"),
+        [this](Keybind const& keybind, bool down, bool repeat, double time) {
+            if (repeat || ignoreKeybind()) return;
+
+            down ? this->resumeVoiceRecording() : this->pauseVoiceRecording();
+        }
+    );
+
+    this->addEventListener(
+        KeybindSettingPressedEventV3(Mod::get(), "keybind-hide-players"),
+        [this](Keybind const& keybind, bool down, bool repeat, double time) {
+            if (repeat || !down || ignoreKeybind()) return;
+
+            this->toggleHidePlayers();
+        }
+    );
+
+    this->addEventListener(
+        KeybindSettingPressedEventV3(Mod::get(), "keybind-deafen"),
+        [this](Keybind const& keybind, bool down, bool repeat, double time) {
+            if (repeat || !down || ignoreKeybind()) return;
+
+            this->toggleDeafen();
+        }
+    );
+
+    for (size_t i = 0; i < 8; i++) {
+        this->addEventListener(
+            KeybindSettingPressedEventV3(Mod::get(), fmt::format("keybind-emote-{}", i)),
+            [this, i](Keybind const& keybind, bool down, bool repeat, double time) {
+                if (repeat || !down || ignoreKeybind()) return;
+
+                this->playSelfFavoriteEmote(i);
+            }
+        );
+    }
+}
+
+void GlobedGJBGL::onEnterHook() {
+    // when unpausing regularly, this is true, otherwise false
+    auto weRunningScene = this->getParent() == CCScene::get();
+
+    if (weRunningScene) {
+        CCLayer::onEnter();
+        return;
+    }
+
+    Loader::get()->queueInMainThread([self = Ref(this)] {
+        // i forgot why i don't use `self` here and also apparently GlobedGJBGL::get can be null here for 1 person in the world
+        auto l = GlobedGJBGL::get();
+        bool isPaused = l ? l->isPaused(false) : self->isPaused(false);
+
+        if (!isPaused) {
+            self->CCLayer::onEnter();
+        }
+    });
+}
+
+void GlobedGJBGL::onQuit() {
+    auto& fields = *m_fields.self();
+    fields.m_quitting = true;
+    fields.cleanup();
+}
+
+void GlobedGJBGL::selPreUpdate(float tsdt) {
+    g_profilerFrame.start = Instant::now();
+
+    auto& fields = *m_fields.self();
+
+    // if we are disconnected from the game server, and no (re)connection is being attempted,
+    // set active to false
+    auto& nm = NetworkManagerImpl::get();
+    if (fields.m_active && nm.getConnState(true) == qn::ConnectionState::Disconnected) {
+        fields.m_active = false;
+    }
+
+    if (!fields.m_active) {
+        if (!fields.m_cleanedUp) {
+            this->cleanupGlobedAdditions();
+            fields.m_cleanedUp = true;
+        }
+        return;
+    }
+
+
+    auto& pcm = PlayerCacheManager::get();
+    auto& rm = RoomManager::get();
+
+    float dt = tsdt / CCScheduler::get()->getTimeScale();
+    fields.m_timeCounter += dt;
+
+    auto camPos = m_gameState.m_cameraPosition;
+    auto cameraDelta = fields.m_cameraTracker.pushMeasurement(fields.m_timeCounter, camPos.x, camPos.y);
+    auto cameraVector = fields.m_cameraTracker.getVector();
+
+    // process stuff
+    fields.m_interpolator.tick(
+        dt,
+        CCPoint{(float) cameraDelta.first, (float) cameraVector.second},
+        CCPoint{(float) cameraVector.first, (float) cameraVector.second}
+    );
+
+    g_profilerFrame.postLerp = Instant::now();
+
+    fields.m_unknownPlayers.clear();
+
+    auto camState = this->getCameraState();
+
+    for (auto it = fields.m_players.begin(); it != fields.m_players.end();) {
+        int playerId = it->first;
+        auto& player = it->second;
+
+        if (!fields.m_interpolator.hasPlayer(playerId)) {
+            log::error("Interpolator is missing a player: {}", playerId);
+            ++it;
+            continue;
+        }
+
+        // if the player has left the level, remove them
+        if (fields.m_interpolator.isPlayerStale(playerId, fields.m_lastServerUpdate)) {
+            this->handlePlayerLeave(playerId, false);
+            it = fields.m_players.erase(it);
+            continue;
+        }
+
+        OutFlags flags{};
+        auto& vstate = fields.m_interpolator.getPlayerState(playerId, flags);
+        player->update(vstate, camState, flags, fields.m_playersHidden, fields.m_noGlobalCulling);
+
+        // if we don't know player's data yet (username, icons, etc.), request it
+        bool dataInit = player->isDataInitialized();
+        bool dataOutdated = player->isDataOutdated();
+
+        if (!dataInit || dataOutdated) {
+            bool inLayer1 = pcm.hasInLayer1(playerId);
+            bool inAny = pcm.has(playerId);
+
+            // if not in layer 1, always request more up to date data
+            if (!inLayer1) {
+                fields.m_unknownPlayers.push_back(playerId);
+            }
+
+            // if not initialized, use whatever we have
+            if (!dataInit && inAny) {
+                player->initData(*pcm.get(playerId), !inLayer1);
+            } else if (dataOutdated && inLayer1) {
+                // if outdated and we received layer 1 data, update from there
+                player->initData(*pcm.get(playerId), false);
+            }
+        } else if (!player->isTeamInitialized() && rm.getSettings().teams) {
+            if (auto teamId = rm.getTeamIdForPlayer(playerId)) {
+                player->updateTeam(*teamId);
+            } else {
+                log::debug("player {} has unknown team", playerId);
+            }
+        }
+
+        ++it;
+    }
+
+    g_profilerFrame.postRPUpdate = Instant::now();
+
+    // update audio
+    if (fields.m_audioInterval.tick()) {
+        AudioManager::get().updatePlayback(camState.cameraCenter(), fields.m_isVoiceProximity);
+    }
+
+    g_profilerFrame.postAudioUpdate = Instant::now();
+
+    // -- commented chunk below is from globed v2, we no longer do this optimization for now --
+    // // the server might not send any updates if there are no players on the level,
+    // // if we receive no response for a while, assume all players have left
+    // if (fields.m_timeCounter - fields.m_lastServerUpdate > 1.5f && fields.m_players.size() <= 2) {
+    //     for (auto it = fields.m_players.begin(); it != fields.m_players.end(); ) {
+    //         int playerId = it->first;
+    //         this->handlePlayerLeave(playerId, false);
+    //         it = fields.m_players.erase(it);
+    //     }
+    // }
+
+    // refresh teams if needed
+    if (rm.getSettings().teams) {
+        if (fields.m_timeCounter - fields.m_lastTeamRefresh > 10.f) {
+            NetworkManagerImpl::get().sendGetTeamMembers();
+            fields.m_lastTeamRefresh = fields.m_timeCounter;
+        }
+    }
+
+    // readjust send interval if needed
+    if (fields.m_sendInterval.interval().isZero()) {
+        auto& nm = NetworkManagerImpl::get();
+        auto tr = nm.getGameTickrate();
+
+        if (tr != 0) {
+            float val = 1.f / std::min<float>(240.f, tr);
+            auto interval = Duration::fromSecsF32(val).value();
+            fields.m_sendInterval.setInterval(interval);
+            fields.m_sendThrottledInterval.setInterval(interval * 8.f);
+
+            log::debug("Data send interval: {:.3}s (tickrate: {})", val, tr);
+        }
+    }
+
+    CoreImpl::get().onPreUpdate(this, dt);
+
+    g_profilerFrame.postPreUpdateEnd = Instant::now();
+}
+
+void GlobedGJBGL::selPostUpdate(float dt) {
+    g_profilerFrame.postGameUpdate = Instant::now();
+
+    auto& fields = *m_fields.self();
+    if (!fields.m_active) return;
+
+    auto camState = this->getCameraState();
+
+    // send player data to the server
+    auto state = this->getPlayerState();
+    auto& sendInterval = fields.m_throttleUpdates
+        ? fields.m_sendThrottledInterval
+        : fields.m_sendInterval;
+
+    if (sendInterval.tick()) {
+        this->sendPlayerData(state);
+    }
+
+    g_profilerFrame.postSendPlayerData = Instant::now();
+
+    // update ghost player
+    OutFlags ghostFlags{};
+    state.accountId = 0;
+    fields.m_ghost->update(state, camState, ghostFlags, false);
+
+    fields.m_periodicalDelta += dt;
+    if (fields.m_periodicalDelta >= 0.25f) {
+        this->selPeriodicalUpdate(fields.m_periodicalDelta);
+        fields.m_periodicalDelta = 0.f;
+    }
+
+    g_profilerFrame.postPeriodicalUpdate = Instant::now();
+
+    // fix progressbar
+    if constexpr (APPLY_PERCENTAGE_FIX) {
+        this->fixProgressBar(state.progress());
+    }
+
+    CoreImpl::get().onUpdate(this, dt);
+
+    g_profilerFrame.postPostUpdateEnd = Instant::now();
+
+    if (fields.m_profilerOverlay) {
+        auto& fr = g_profilerFrame;
+
+        auto totalTime = fr.postPostUpdateEnd.durationSince(fr.start);
+        fields.m_profilerOverlay->updateWithFrame(ProfilerFrame {
+            .totalTime = totalTime,
+            .samples = {
+                ProfilerSample { "Interpolation", fr.start, fr.postLerp, "#23e8fa" },
+                ProfilerSample { "Player Upd", fr.postLerp, fr.postRPUpdate, "#4caf50" },
+                ProfilerSample { "Audio Upd", fr.postRPUpdate, fr.postAudioUpdate, "#0707f2" },
+                ProfilerSample { "Pre Misc", fr.postAudioUpdate, fr.postPreUpdateEnd, "#757575" },
+                ProfilerSample { "Game Update", fr.postPreUpdateEnd, fr.postGameUpdate, "#ffeb3b" },
+                ProfilerSample { "Send Data", fr.postGameUpdate, fr.postSendPlayerData, "#fb8c00" },
+                ProfilerSample { "Periodical Upd", fr.postSendPlayerData, fr.postPeriodicalUpdate, "#e91e63" },
+                ProfilerSample { "Post Misc", fr.postPeriodicalUpdate, fr.postPostUpdateEnd, "#455a64" },
+            }
+        });
+    }
+}
+
+// Note: this takes percent from 0.0 to 1.0
+void GlobedGJBGL::fixProgressBar(float percent) {
+    auto pl = this->asPlayLayer();
+    if (!pl || !pl->m_progressFill) return;
+
+    pl->m_progressFill->setTextureRect({
+        0.f, 0.f,
+        pl->m_progressWidth * percent,
+        pl->m_progressHeight
+    });
+}
+
+void GlobedGJBGL::selPeriodicalUpdate(float dt) {
+    auto& fields = *m_fields.self();
+
+    // show a little alert icon in the corner if there's any popups waiting to be shown
+    bool anyPopups = PopupManager::get().hasPendingPopups();
+    if (anyPopups != fields.m_showingNoticeAlert) {
+        fields.m_showingNoticeAlert = anyPopups;
+        this->setNoticeAlertActive(anyPopups);
+    }
+
+    if (!fields.m_active) {
+        fields.m_pingOverlay->updateWithDisconnected();
+        return;
+    }
+
+    fields.m_pingOverlay->updatePing();
+
+    // check if the user is afk
+    auto state = getCurrentGameState();
+    if (state != GameState::Active) {
+        // stop recording audio if the user is afk
+        this->pauseVoiceRecording();
+    }
+
+    // send data less often if the game is inactive or there are no other players
+    bool prevThrottle = fields.m_throttleUpdates;
+    fields.m_throttleUpdates = state == GameState::Closed || fields.m_players.empty();
+
+    if (fields.m_disallowThrottle) {
+        fields.m_throttleUpdates = false;
+    }
+
+    if (prevThrottle != fields.m_throttleUpdates) {
+        log::debug("updating data send interval to {}", fields.m_throttleUpdates ? "throttled" : "normal");
+    }
+
+    // TODO
+    // NetworkManagerImpl::get().sendPlayerUpdateMeta({1234,}, {myAccountId(),});
+}
+
+void GlobedGJBGL::sendPlayerData(const PlayerState& state) {
+    auto& nm = NetworkManagerImpl::get();
+    // do not do anything if we aren't connected
+    if (!nm.isGameConnected()) return;
+
+    auto& fields = *m_fields.self();
+    fields.m_totalSentPackets++;
+
+    std::vector<int> toRequest;
+    float sinceRequest = fields.m_timeCounter - fields.m_lastDataRequest;
+
+    // only request data if there's no in flight request or more than 1 second has passed since one was made (likely lost)
+    if (fields.m_lastDataRequest == 0.f || sinceRequest > 1.f) {
+        toRequest.reserve(std::min<size_t>(fields.m_unknownPlayers.size(), 64));
+
+        for (int player : m_fields->m_unknownPlayers) {
+            if (player <= 0 || toRequest.size() >= 64) {
+                continue;
+            }
+
+            toRequest.push_back(player);
+        }
+
+        // only set it if we requested any players, then if someone else joins (or if we just joined)
+        // we will immediately be able to fetch their data without waiting up to a second
+        if (!toRequest.empty()) {
+            fields.m_lastDataRequest = fields.m_timeCounter;
+        }
+
+        // TODO: technically there's a possibility for a "ghost player" where we think they are on the level, but the server is not aware of them,
+        // this will cause them to be sent every single time (as the server will never send their data). not sure how to handle this yet.
+    }
+
+    // get camera position and radius
+    auto camState = this->getCameraState();
+    auto coverage = camState.cameraCoverage();
+
+    CCPoint camCenter = camState.cameraOrigin + coverage / 2.f;
+
+    float camRadius = fields.m_noGlobalCulling
+        ? INFINITY
+        : std::max(coverage.width, coverage.height) / 2.f * 2.75f;
+
+    // extend the radius to the proximity limit
+    camRadius = std::max(camRadius, PROXIMITY_AUDIO_LIMIT);
+    // log::trace(
+    //     "camera: origin {}, vorigin {}, vcov {}, zoom {} => cov {}, center {}, radius {}",
+    //     camState.cameraOrigin,
+    //     camState.visibleOrigin,
+    //     camState.visibleCoverage,
+    //     camState.zoom,
+    //     coverage,
+    //     camCenter,
+    //     camRadius
+    // );
+
+    nm.sendPlayerState(state, toRequest, camCenter, camRadius);
+}
+
+PlayerState GlobedGJBGL::getPlayerState() {
+    auto& fields = *m_fields.self();
+
+    PlayerState out{};
+    out.accountId = myAccountId();
+    out.timestamp = fields.m_timeCounter;
+    out.frameNumber = 0;
+    out.deathCount = fields.m_deathCount;
+
+    // this function (getCurrentPercent) only exists in playlayer and not the editor, so reimpl it
+    auto getPercent = [&](){
+        float percent;
+
+        if (m_level->m_timestamp > 0) {
+            if constexpr (APPLY_PERCENTAGE_FIX) {
+                percent = static_cast<float>(m_gameState.m_levelTime * 240.f) / m_level->m_timestamp * 100.f;
+            } else {
+                percent = static_cast<float>(m_gameState.m_currentProgress) / m_level->m_timestamp / 2.f * 100.f;
+            }
+        } else {
+            percent = m_player1->getPosition().x / m_levelLength * 100.f;
+        }
+
+        return std::clamp(percent, 0.f, 100.f);
+    };
+
+    double progress = (double)getPercent() / 100.0;
+    if (std::isnan(progress) || std::isinf(progress)) {
+        progress = 0.0;
+    }
+
+    out.percentage = static_cast<uint16_t>(std::floor(progress * 65535.0));
+    out.isDead = m_player1->m_isDead || m_player2->m_isDead;
+    out.isPaused = this->isPaused();
+    out.isPracticing = m_isPracticeMode;
+    out.isInEditor = this->isEditor();
+    out.isEditorBuilding = out.isInEditor && m_playbackMode == PlaybackMode::Not;
+    out.isLastDeathReal = fields.m_lastLocalDeathReal;
+
+    auto getPlayerObjState = [this, &fields](PlayerObject* obj, PlayerObjectData& out, bool player1){
+        using enum PlayerIconType;
+
+        PlayerIconType iconType = Cube;
+        if (obj->m_isShip) iconType = m_level->isPlatformer() ? Jetpack : Ship;
+        else if (obj->m_isBall) iconType = Ball;
+        else if (obj->m_isBird) iconType = Ufo;
+        else if (obj->m_isDart) iconType = Wave;
+        else if (obj->m_isRobot) iconType = Robot;
+        else if (obj->m_isSpider) iconType = Spider;
+        else if (obj->m_isSwing) iconType = Swing;
+        out.iconType = iconType;
+
+        auto pobjInner = obj->getChildrenExt()[0];
+        out.position = obj->getPosition();
+        out.rotation = globed::normalizeAngle(obj->getRotation());
+
+        out.isVisible = obj->isVisible();
+        out.isLookingLeft = obj->m_isGoingLeft;
+        out.isUpsideDown = obj->m_isUpsideDown;
+        out.isDashing = obj->m_isDashing;
+        out.isMini = obj->m_vehicleSize != 1.0f;
+        out.isGrounded = obj->m_isOnGround;
+        out.isStationary = m_level->isPlatformer() ? std::abs(obj->m_platformerXVelocity) < 0.1 : false;
+        out.isFalling = obj->m_yVelocity < 0.0f;
+        out.isRotating = obj->m_isRotating;
+        out.isSideways = obj->m_isSideways;
+        out.didJustJump = (player1 ? fields.m_didJustJump1 : fields.m_didJustJump2).take();
+        out.isFlipped = obj->m_mainLayer->getScaleY() < -0.f;
+        auto& hb = obj->m_holdingButtons;
+        out.isHolding = hb.contains(1) && hb.at(1);
+
+        if (fields.m_sendExtData) {
+            // gather some extra data
+            auto ed = ExtendedPlayerData{};
+            ed.velocityX = obj->m_platformerXVelocity;
+            ed.velocityY = obj->m_yVelocity;
+            ed.accelerating = obj->m_isAccelerating;
+            ed.acceleration = obj->m_accelerationOrSpeed;
+            ed.fallStartY = obj->m_fallStartY;
+            ed.isOnGround2 = obj->m_isOnGround2;
+            ed.gravityMod = obj->m_gravityMod;
+            ed.gravity = obj->m_gravity;
+            ed.touchedPad = obj->m_touchedPad;
+            ed.maybeFalling = obj->m_maybeIsFalling;
+            ed.fallSpeed = obj->m_fallSpeed;
+            ed.isOnGround4 = obj->m_isOnGround4;
+
+            out.extData = ed;
+        }
+    };
+
+    out.player1 = PlayerObjectData{};
+    getPlayerObjState(m_player1, *out.player1, true);
+
+    if (m_gameState.m_isDualMode) {
+        out.player2 = PlayerObjectData{};
+        getPlayerObjState(m_player2, *out.player2, false);
+    }
+
+    return out;
+}
+
+bool GlobedGJBGL::isPaused(bool checkCurrent) {
+    if (this->isEditor()) {
+        return m_playbackMode == PlaybackMode::Paused;
+    }
+
+    if (checkCurrent && !this->isCurrentPlayLayer()) {
+        return false;
+    }
+
+    for (CCNode* child : CCArrayExt<CCNode*>(this->getParent()->getChildren())) {
+        if (typeinfo_cast<PauseLayer*>(child)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool GlobedGJBGL::isEditor() {
+    // return m_fields->m_editor;
+    return m_isEditor;
+}
+
+bool GlobedGJBGL::isSpectating() {
+    return m_fields->m_spectating;
+}
+
+void GlobedGJBGL::setDisallowThrottleUpdates() {
+    m_fields->m_disallowThrottle = true;
+}
+
+void GlobedGJBGL::setSpectating(bool spectate) {
+    m_fields->m_spectating = spectate;
+}
+
+bool GlobedGJBGL::isCurrentPlayLayer() {
+    auto pl = CCScene::get()->getChildByType<PlayLayer>(0);
+    return static_cast<GJBaseGameLayer*>(pl) == this;
+}
+
+bool GlobedGJBGL::isManuallyResetting() {
+    return m_fields->m_manualReset;
+}
+
+bool GlobedGJBGL::isSafeMode() {
+    return m_fields->m_safeMode;
+}
+
+bool GlobedGJBGL::isQuitting() {
+    return m_fields->m_quitting;
+}
+
+void GlobedGJBGL::handlePlayerJoin(int playerId) {
+    auto& sm = SettingsManager::get();
+    auto& fields = *m_fields.self();
+
+#ifdef GLOBED_DEBUG
+    log::debug("Player joined: {}", playerId);
+#endif
+
+    if (fields.m_players.contains(playerId)) {
+        return;
+    }
+
+    auto rp = std::make_shared<RemotePlayer>(playerId, this, fields.m_playerNode);
+    rp->setForceHide(sm.isPlayerHidden(playerId));
+    fields.m_players.emplace(playerId, std::move(rp));
+    fields.m_interpolator.addPlayer(playerId);
+
+    CoreImpl::get().onPlayerJoin(this, playerId);
+}
+
+void GlobedGJBGL::handlePlayerLeave(int playerId, bool removeFromMap) {
+    auto& am = AudioManager::get();
+
+    auto& fields = *m_fields.self();
+
+#ifdef GLOBED_DEBUG
+    log::debug("Player left: {}", playerId);
+#endif
+
+    if (!fields.m_players.contains(playerId)) {
+        return;
+    }
+
+    auto& player = fields.m_players.at(playerId);
+    player->stopVoiceStream();
+    CoreImpl::get().onPlayerLeave(this, playerId);
+
+    if (removeFromMap) {
+        fields.m_players.erase(playerId);
+    }
+
+    fields.m_interpolator.removePlayer(playerId);
+    PlayerCacheManager::get().evictToLayer2(playerId);
+
+    if (fields.m_voiceOverlay) {
+        fields.m_voiceOverlay->removeStream(playerId);
+    }
+}
+
+void GlobedGJBGL::handleLocalPlayerDeath(PlayerObject* obj) {
+    auto& fields = *m_fields.self();
+
+    fields.m_deathCount++;
+    fields.m_lastLocalDeathReal = !fields.m_isFakingDeath;
+
+    CoreImpl::get().onLocalPlayerDeath(this, fields.m_lastLocalDeathReal);
+}
+
+void GlobedGJBGL::setPermanentSafeMode() {
+    auto& fields = *m_fields.self();
+
+    fields.m_permanentSafeMode = true;
+    fields.m_safeMode = true;
+}
+
+void GlobedGJBGL::killLocalPlayer(bool fake) {
+    auto& fields = *m_fields.self();
+    log::debug("Killing player");
+
+    // do nothing if already in the middle of a death
+    if (m_player1->m_isDead) {
+        log::debug("Not killing because player is already dead");
+        return;
+    }
+
+    fields.m_isFakingDeath = fake;
+
+    this->destroyPlayer(m_player1, nullptr);
+
+    fields.m_isFakingDeath = false;
+}
+
+void GlobedGJBGL::cancelLocalRespawn() {
+    this->stopActionByTag(0x10); // magic
+}
+
+void GlobedGJBGL::causeLocalRespawn(bool full) {
+    auto pl = this->asPlayLayer();
+    if (!pl || !pl->getParent()) return;
+
+    auto scene = CCScene::get();
+    auto pauselayer = scene->getChildByType<PauseLayer>(0);
+    if (!pauselayer) {
+        pl->pauseGame(false);
+        pauselayer = scene->getChildByType<PauseLayer>(0);
+    }
+
+    if (pauselayer) {
+        pauselayer->decrementForcePrio();
+    }
+    pl->resumeAndRestart(true);
+
+    if (pauselayer) {
+        pauselayer->removeFromParent();
+    }
+}
+
+void GlobedGJBGL::resetSafeMode() {
+    auto& fields = *m_fields.self();
+    fields.m_safeMode = fields.m_permanentSafeMode;
+}
+
+void GlobedGJBGL::enableSafeMode() {
+    auto& fields = *m_fields.self();
+    fields.m_safeMode = true;
+}
+
+void GlobedGJBGL::pausedUpdate(float dt) {
+    auto& fields = *m_fields.self();
+    if (!fields.m_active) return;
+
+    // unpause dash effects and death effects
+    int tag1 = SPIDER_DASH_CIRCLE_WAVE_TAG;
+    int tag2 = SPIDER_DASH_SPRITE_TAG;
+    int tag3 = DEATH_EFFECT_TAG;
+
+    for (auto* child : m_objectLayer->getChildrenExt()) {
+        int ctag = child->getTag();
+        if (ctag == tag1 || ctag == tag2 || ctag == tag3) {
+            child->onEnter();
+        }
+    }
+
+    for (auto* child : fields.m_playerNode->getChildrenExt()) {
+        int ctag = child->getTag();
+        bool resume =
+            ctag == tag1 || ctag == tag2 || ctag == tag3
+            || typeinfo_cast<EmoteBubble*>(child)
+            || typeinfo_cast<ExplodeItemNode*>(child);
+
+        if (resume) {
+            child->onEnter();
+        }
+    }
+}
+
+PlayLayer* GlobedGJBGL::asPlayLayer() {
+    if (!m_isEditor) {
+        return static_cast<PlayLayer*>(static_cast<GJBaseGameLayer*>(this));
+    } else {
+        return nullptr;
+    }
+}
+
+GlobedGJBGL* GlobedGJBGL::get(GJBaseGameLayer* base) {
+    if (!base) {
+        base = singleton<GameManager>()->m_gameLayer;
+    }
+
+    return static_cast<GlobedGJBGL*>(base);
+}
+
+GlobedGJBGL* GlobedGJBGL::getActive(GJBaseGameLayer* base) {
+    auto gjbgl = get(base);
+    return gjbgl && gjbgl->active() ? gjbgl : nullptr;
+}
+
+bool GlobedGJBGL::active() {
+    return m_fields->m_active;
+}
+
+CameraDirection GlobedGJBGL::getCameraDirection() {
+    float angle = -m_gameState.m_cameraAngle;
+
+    float radians = angle * M_PI / 180.f;
+    CCPoint vec{std::sin(radians), std::cos(radians)};
+
+    return CameraDirection{
+        .vector = vec,
+        .angle = angle,
+    };
+}
+
+GameCameraState GlobedGJBGL::getCameraState() {
+    GameCameraState state{};
+    state.visibleOrigin = CCPoint{0.f, 0.f};
+    state.visibleCoverage = singleton<CCDirector>()->getWinSize();
+    state.cameraOrigin = m_gameState.m_cameraPosition;
+    state.zoom = m_objectLayer->getScale();
+
+    return state;
+}
+
+std::shared_ptr<RemotePlayer> GlobedGJBGL::getPlayer(int playerId) {
+    auto& players = m_fields->m_players;
+
+    auto it = players.find(playerId);
+
+    return it == players.end() ? nullptr : it->second;
+}
+
+void GlobedGJBGL::recordPlayerJump(bool p1) {
+    auto& fields = *m_fields.self();
+    (p1 ? fields.m_didJustJump1 : fields.m_didJustJump2) = true;
+}
+
+bool GlobedGJBGL::shouldLetMessageThrough(int playerId) {
+    auto& sm = SettingsManager::get();
+    auto& flm = FriendListManager::get();
+
+    if (sm.isPlayerBlacklisted(playerId)) return false;
+    if (sm.isPlayerWhitelisted(playerId)) return true;
+
+    if (g_settings.friendsOnlyAudio && !flm.isFriend(playerId)) return false;
+
+    return true;
+}
+
+bool GlobedGJBGL::isSpeaking(int playerId) {
+    if (!g_settings.voiceChat) return false;
+
+    auto it = m_fields->m_players.find(playerId);
+    if (it == m_fields->m_players.end()) {
+        return false;
+    }
+
+    auto stream = it->second->getVoiceStream();
+    return stream && !stream->isStarving();
+}
+
+bool GlobedGJBGL::isUnableToSpeak() {
+    auto& fields = *m_fields.self();
+
+    return fields.m_knownNotLinked || fields.m_knownServerMuted;
+}
+
+void GlobedGJBGL::setNoticeAlertActive(bool active) {
+    auto& fields = *m_fields.self();
+
+    if (m_isEditor) {
+        // todo
+        return;
+    }
+
+    // Add the alert if it does not exist
+    if (!fields.m_noticeAlert) {
+        auto pbm = this->m_uiLayer->getChildByID("pause-button-menu");
+        if (!pbm) {
+            log::warn("pause-button-menu not found, not toggling notice alert");
+            return;
+        }
+
+        Build<CCSprite>::createSpriteName("geode.loader/info-alert.png")
+            .scale(0.45f)
+            .opacity(255)
+            .pos(8.f, 8.f)
+            .id("notice-alert"_spr)
+            .parent(pbm)
+            .store(fields.m_noticeAlert);
+
+        fields.m_noticeAlert->runAction(
+            CCRepeatForever::create(
+                CCSequence::create(
+                    CCFadeTo::create(0.65f, 150),
+                    CCFadeTo::create(0.65f, 255),
+                    nullptr
+                )
+            )
+        );
+    }
+
+    if (fields.m_noticeAlert) {
+        fields.m_noticeAlert->setVisible(active);
+    }
+}
+
+void GlobedGJBGL::toggleCullingEnabled(bool culling) {
+    m_fields->m_noGlobalCulling = !culling;
+}
+
+void GlobedGJBGL::toggleExtendedData(bool extended) {
+    m_fields->m_sendExtData = extended;
+}
+
+void GlobedGJBGL::toggleHidePlayers() {
+    auto& fields = *m_fields.self();
+    fields.m_playersHidden = !fields.m_playersHidden;
+
+    Notification::create(
+        fields.m_playersHidden ? "All Players Hidden" : "All Players Visible",
+        NotificationIcon::Success,
+        0.2f
+    )->show();
+}
+
+void GlobedGJBGL::toggleDeafen() {
+    bool& deafen = m_fields->m_deafened;
+    deafen = !deafen;
+
+    if (globed::setting<bool>("core.audio.deafen-notification")) {
+        globed::toast(
+            CCSprite::create(deafen ? "deafen-icon-on.png"_spr : "deafen-icon-off.png"_spr),
+            0.2f,
+            deafen ? "Deafened Voice Chat" : "Undeafened Voice Chat"
+        );
+    }
+
+    AudioManager::get().setDeafen(deafen);
+}
+
+void GlobedGJBGL::resumeVoiceRecording() {
+#ifdef GLOBED_VOICE_CAN_TALK
+    if (!g_settings.voiceChat) return;
+
+    auto& am = AudioManager::get();
+    if (am.getDeafen()) {
+        auto kbs = Mod::get()->getSettingValue<std::vector<Keybind>>("keybind-deafen");
+        std::string kbstr = kbs.empty() ? "<unbound>" : kbs[0].toString();
+
+        globed::toastError("(Globed) Cannot talk while deafened, press {} to undeafen", kbstr);
+        return;
+    }
+
+    AudioManager::get().resumePassiveRecording();
+#endif
+}
+
+void GlobedGJBGL::pauseVoiceRecording() {
+#ifdef GLOBED_VOICE_CAN_TALK
+    AudioManager::get().pausePassiveRecording();
+#endif
+}
+
+void GlobedGJBGL::setCameraFollowPlayer(PlayerObject* player) {
+    // TODO: this weird syntax because operator=(T*) is broken right now in geode
+    m_fields->m_cameraFollows = WeakRef{player};
+}
+
+void GlobedGJBGL::updateCamera(float dt) {
+    auto& follows = m_fields->m_cameraFollows;
+    auto pl = follows.lock();
+
+    if (!pl) {
+        return GJBaseGameLayer::updateCamera(dt);
+    }
+
+    auto prevPos = m_player1->getPosition();
+    m_player1->setPosition(pl->getPosition());
+    GJBaseGameLayer::updateCamera(dt);
+    m_player1->setPosition(prevPos);
+}
+
+void GlobedGJBGL::onLevelDataReceived(const msg::LevelDataMessage& message) {
+    auto& fields = *m_fields.self();
+    if (!fields.m_active) return;
+
+    fields.m_lastServerUpdate = fields.m_timeCounter;
+
+    for (auto& player : message.players) {
+        if (player.accountId <= 0) continue;
+
+        if (!fields.m_players.contains(player.accountId)) {
+            this->handlePlayerJoin(player.accountId);
+        }
+
+        fields.m_interpolator.updatePlayer(player, fields.m_lastServerUpdate);
+    }
+
+    // check for refreshed events
+    for (auto& event : message.events) {
+        if (event.is<DisplayDataRefreshed>()) {
+            int player = event.as<DisplayDataRefreshed>().playerId;
+
+            // refresh this player's data
+            PlayerCacheManager::get().evictToLayer2(player);
+            fields.m_lastDataRequest = 0.f;
+            if (auto rp = this->getPlayer(player)) {
+                rp->markDataOutdated();
+            }
+        }
+    }
+
+    for (auto& dd : message.displayDatas) {
+        if (dd.accountId <= 0) continue; // should never happen?
+
+        PlayerCacheManager::get().insert(dd.accountId, dd);
+    }
+
+    if (!message.displayDatas.empty()) {
+        fields.m_lastDataRequest = 0.f;
+    }
+}
+
+void GlobedGJBGL::onLevelMetaReceived(const msg::LevelMetaMessage& message) {
+    for (auto& [id, meta] : message.metas) {
+        log::info("player {} progress {}", id, meta.progress);
+    }
+}
+
+void GlobedGJBGL::onVoiceDataReceived(msg::VoiceBroadcastMessage& message) {
+    auto& fields = *m_fields.self();
+    if (!fields.m_active) return;
+
+    auto& am = AudioManager::get();
+    if (am.getDeafen() || !g_settings.voiceChat) {
+        return;
+    }
+
+    if (!this->shouldLetMessageThrough(message.accountId)) {
+        return;
+    }
+
+    if (auto player = this->getPlayer(message.accountId)) {
+        player->playVoiceData(std::move(message.frame));
+    }
+}
+
+void GlobedGJBGL::onQuickChatReceived(int accountId, uint32_t quickChatId) {
+    auto& fields = *m_fields.self();
+    if (!fields.m_active || !g_settings.quickChat) return;
+
+    if (!this->shouldLetMessageThrough(accountId)) {
+        return;
+    }
+
+    auto it = fields.m_players.find(accountId);
+    if (it == fields.m_players.end()) {
+        return;
+    }
+
+    it->second->player1()->playEmote(quickChatId);
+}
+
+void GlobedGJBGL::onJoinSessionFailed(const msg::JoinSessionFailedMessage& message) {
+    using enum msg::JoinSessionFailedReason;
+
+    std::string msg;
+    switch (message.reason) {
+        case InvalidPasscode: msg = "invalid passcode"; break;
+        case InvalidRoom: msg = "invalid room"; break;
+        default: msg = "unknown error"; break;
+    }
+
+    globed::toastError("Failed to join session: {}", msg);
+
+    auto& fields = *m_fields.self();
+    fields.m_active = false;
+}
+
+void GlobedGJBGL::cleanupGlobedAdditions() {
+    auto& am = AudioManager::get();
+    am.haltRecording();
+    am.stopAllOutputSources();
+
+    auto& fields = *m_fields.self();
+    cue::resetNode(fields.m_playerNode);
+    cue::resetNode(fields.m_progressBarContainer);
+    cue::resetNode(fields.m_voiceOverlay);
+    cue::resetNode(fields.m_profilerOverlay);
+    fields.m_ghost.reset();
+    fields.m_interpolator.fullReset();
+    if (fields.m_pingOverlay) {
+        fields.m_pingOverlay->updateWithDisconnected();
+    }
+
+    for (auto it = fields.m_players.begin(); it != fields.m_players.end();) {
+        this->handlePlayerLeave(it->first, false);
+        it = fields.m_players.erase(it);
+    }
+}
+
+bool GlobedGJBGL::playSelfEmote(uint32_t id) {
+    auto& fields = *m_fields.self();
+    if (!fields.m_active) return false;
+
+    if (!g_settings.quickChat) {
+        return false;
+    }
+
+    // check if we are on cooldown
+    auto now = Instant::now();
+    if (g_lastEmoteTime && now.durationSince(*g_lastEmoteTime) < EMOTE_COOLDOWN) {
+        return false;
+    }
+    g_lastEmoteTime = now;
+
+    fields.m_ghost->player1()->playEmote(id);
+
+    NetworkManagerImpl::get().sendQuickChat(id);
+
+    return true;
+}
+
+bool GlobedGJBGL::playSelfFavoriteEmote(uint32_t which) {
+    auto emote = EmoteManager::get().getFavoriteEmote(which);
+
+    if (emote != 0) {
+        return this->playSelfEmote(emote);
+    }
+    return false;
+}
+
+struct GLOBED_MODIFY_ATTR PlayerObjectHideHook : public Modify<PlayerObjectHideHook, GameObject> {
+    struct Fields {
+        bool m_realVisibility = true;
+        bool m_customVisibility = true;
+    };
+
+    static PlayerObjectHideHook* get(GameObject* ptr) {
+        return static_cast<PlayerObjectHideHook*>(ptr);
+    }
+
+    void setCustomHide(bool hide) {
+        auto& fields = *m_fields.self();
+        if (fields.m_customVisibility == !hide) {
+            return;
+        }
+
+        fields.m_customVisibility = !hide;
+        GameObject::setVisible(fields.m_realVisibility); // refresh
+    }
+
+    void setVisible(bool visible) {
+        if (m_objectID == 0 && typeinfo_cast<PlayerObject*>(this)) {
+            auto& fields = *m_fields.self();
+            fields.m_realVisibility = visible;
+            visible = visible && fields.m_customVisibility;
+        }
+
+        GameObject::setVisible(visible);
+
+        // TODO: trails n particles ?
+
+        // if (hidden) {
+        //     if (obj->m_ghostType != GhostType::Disabled) {
+        //         obj->toggleGhostEffect(GhostType::Disabled);
+        //     }
+        // }
+
+        // obj->m_playEffects = !hidden;
+        // hideNode(obj->m_regularTrail, hidden);
+        // hideNode(obj->m_waveTrail, hidden);
+        // hideNode(obj->m_trailingParticles, hidden);
+        // hideNode(obj->m_shipStreak, hidden);
+        // hideNode(obj->m_playerGroundParticles, hidden);
+        // hideNode(obj->m_vehicleGroundParticles, hidden);
+
+        // if (auto gjbgl = GlobedGJBGL::getActive(m_gameLayer)) {
+
+        // }
+    }
+};
+
+void setPlayerHidden(PlayerObject* obj, bool hidden) {
+    if (!obj) return;
+    PlayerObjectHideHook::get(obj)->setCustomHide(hidden);
+}
+
+void setPlayerHidden(RemotePlayer* obj, bool hidden) {
+    if (!obj) return;
+    setPlayerHidden(obj->player1(), hidden);
+    setPlayerHidden(obj->player2(), hidden);
+}
+
+class GJBGLUpdater : public CCObject {
+public:
+    void update(float dt) override {
+        if (auto gjbgl = GlobedGJBGL::get()) {
+            gjbgl->selPreUpdate(dt);
+        }
+    }
+
+    void postUpdate(float dt) {
+        if (auto gjbgl = GlobedGJBGL::get()) {
+            gjbgl->selPostUpdate(dt);
+        }
+    }
+};
+
+$on_mod(Loaded) {
+    auto updater = new GJBGLUpdater();
+    CCScheduler::get()->scheduleUpdateForTarget(updater, -100, false);
+    CCScheduler::get()->scheduleSelector(schedule_selector(GJBGLUpdater::postUpdate), updater, 0.f, false);
+}
+
+}

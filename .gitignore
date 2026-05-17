@@ -1,0 +1,86 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# macOS Thumbnail Caches
+**/.DS_Store
+
+# Cache files for Sublime Text
+*.tmlanguage.cache
+*.tmPreferences.cache
+*.stTheme.cache
+
+# Ignore build folders
+**/build
+# Ignore platform specific build folders
+build-*/
+
+# Workspace files are user-specific
+*.sublime-workspace
+
+# Visual Studio Code
+**/.vscode
+
+# Local History for Visual Studio Code
+.history/
+
+# clangd
+.cache/
+
+# Visual Studio
+.vs/
+
+# CLion
+.idea/
+/cmake-build-*/
+
+
+*.log
+
+src/modules/comm
+
+_old-src
+resources-old
+bloaty-*.txt
+mod.json
+!libs/bb/*
+
+*.py
+*.sh
+!geobuild.py
+!rescale.py
+
+__pycache__
+config.toml
+
+ios-building
+frida-*.js

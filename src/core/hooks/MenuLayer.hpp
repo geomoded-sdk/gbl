@@ -1,0 +1,22 @@
+#pragma once
+
+#include <globed/config.hpp>
+#include <Geode/Geode.hpp>
+#include <Geode/modify/MenuLayer.hpp>
+
+namespace globed {
+
+struct GLOBED_DLL HookedMenuLayer : geode::Modify<HookedMenuLayer, MenuLayer> {
+    struct Fields {
+        std::optional<bool> btnActive;
+        geode::Ref<CCMenuItemSpriteExtra> btn;
+    };
+
+    $override bool init();
+
+    void recreateButton();
+    void onGlobedButton(cocos2d::CCObject*);
+    void checkButton(float);
+};
+
+}
